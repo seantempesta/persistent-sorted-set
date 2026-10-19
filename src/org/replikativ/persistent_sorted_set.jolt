@@ -975,9 +975,6 @@
   (equals [this o] (.equiv this o))
   (toString [this] (str "#{" (clojure.string/join " " (map str this)) "}")))
 
-(defmethod print-method PersistentSortedSet [s ^java.io.Writer w]
-  (.write w (str "#{" (clojure.string/join " " (map pr-str s)) "}")))
-
 (defn- grow-root [nodes settings]
   (let [n (alength nodes)
         keys (object-array n)
@@ -1138,3 +1135,25 @@
        (Branch. level n ks (to-array addresses) nil (long (or subtree-count -1)) settings)))))
 
 (defn default-settings [bf] (make-settings bf))
+
+;; ---------------------------------------------------------------------------
+;; EDN form of stored nodes (konserve StringSerializer on Jolt; the JVM uses Fressian).
+;; Tags have no dot in their namespace: Jolt's clojure.edn ignores :readers for #a.b/T.
+
+(defmethod print-method Leaf [^Leaf n ^java.io.Writer w]
+  (.write w "#pss/leaf ")
+  (print-method (vec (java.util.Arrays/copyOfRange (.-_keys n) 0 (.-_len n))) w))
+
+(defmethod print-method Branch [^Branch n ^java.io.Writer w]
+  (.write w "#pss/branch ")
+  (print-method {:level (.-_level n)
+                 :keys (vec (java.util.Arrays/copyOfRange (.-_keys n) 0 (.-_len n)))
+                 :addresses (.addresses n)
+                 :subtree-count (.-_subtreeCount n)} w))
+
+(defn edn-read-handlers
+  "EDN tag readers for stored nodes; settings is the store's (branching factor)."
+  [settings]
+  {'pss/leaf (fn [ks] (restore-node 0 ks nil settings))
+   'pss/branch (fn [{:keys [level keys addresses subtree-count]}]
+                 (restore-node level keys addresses subtree-count settings))})
