@@ -1,0 +1,1140 @@
+(ns ^{:doc "E4a: persistent-sorted-set's JVM core (org.replikativ.persistent_sorted_set.*, 0.4.137)
+  translated to Clojure deftypes on Jolt. Jolt resolves this .jolt before the jar's .clj, and a
+  deftype in this namespace gets the Java class name org.replikativ.persistent_sorted_set.<Name>,
+  so Datahike's `:clj` imports, `instance?` checks, `extend-type` and interop calls reach it unchanged.
+
+  Covered: count-boundary B+tree (Leaf/Branch), cons/disjoin/replace/lookup/lookupGE/contains,
+  slice/rslice/seek (Seq), countSlice with subtree counts, transients (in-place edits of nodes made
+  in the session, as the Java does), store/restore/walkAddresses through IStorage, ForwardCursor,
+  from-sorted-array/from-sequential.
+  Not covered (Datahike's defaults leave them off): diff-buf (Slot), IMeasure, ILeafProcessor, MST
+  boundary, soft/weak references (all node refs are strong)."}
+ org.replikativ.persistent-sorted-set
+  (:refer-clojure :exclude [conj disj sorted-set sorted-set-by replace])
+  (:require [clojure.string]
+            [org.replikativ.persistent-sorted-set.arrays :as arrays]))
+
+;; ---------------------------------------------------------------------------
+;; Interfaces (the Java interface names Datahike imports)
+
+(definterface IStorage
+  (restore [address])
+  (accessed [address])
+  (store [node])
+  (markFreed [address])
+  (isFreed [address])
+  (freedInfo [address]))
+
+(definterface ISubtreeCount (subtreeCount []))
+
+(definterface ISeek (seek [to]) (seek [to cmp]))
+
+(definterface INode
+  (len [])
+  (level [])
+  (keys [])
+  (maxKey [])
+  (minKey [])
+  (count [storage])
+  (searchFirst [key cmp])
+  (searchLast [key cmp])
+  (walkAddresses [storage on-address])
+  (store [storage]))
+
+(definterface IBranch
+  (address [i])
+  (addresses [])
+  (child [storage i])
+  (slots [])
+  (slotsForStorage []))
+
+(definterface IPersistentSortedSet
+  (cons [key cmp])
+  (disjoin [key cmp])
+  (replace [old-key new-key])
+  (replace [old-key new-key cmp])
+  (lookup [key])
+  (lookup [key cmp])
+  (lookupGE [key])
+  (lookupGE [key cmp])
+  (slice [from to])
+  (slice [from to cmp])
+  (rslice [from to])
+  (rslice [from to cmp])
+  (countSlice [from to])
+  (countSlice [from to cmp])
+  (hasSubtreeCounts [])
+  (root [])
+  (comparator [])
+  (walkAddresses [on-address])
+  (store [])
+  (store [storage])
+  (forwardCursor [])
+  (forwardCursor [cmp]))
+
+(definterface IForwardCursor (seekGE [key]) (next []) (current []))
+
+;; Settings: branching factor and the transient edit flag (a volatile holding true while the
+;; transient session that created a node is open; nil for persistent nodes).
+(deftype Settings [_branchingFactor _edit _diffBufSize])
+
+(defn- settings-editable? [^Settings s]
+  (let [e (.-_edit s)] (and (some? e) @e)))
+
+(defn- make-settings
+  ([] (make-settings 512))
+  ([bf] (Settings. (if (and bf (pos? bf)) (int bf) 512) nil 0)))
+
+(def ^:private ^:const expand-len 8)
+
+(defn- new-len ^long [^long len ^Settings s]
+  (if (settings-editable? s)
+    (min (.-_branchingFactor s) (+ len expand-len))
+    len))
+
+(def EARLY_EXIT (object-array 0))
+(def UNCHANGED (object-array 0))
+
+;; ---------------------------------------------------------------------------
+;; Array helpers
+
+(defn- acopy [src ^long from ^long to dst ^long dst-from]
+  (when (< from to)
+    (System/arraycopy src from dst dst-from (- to from)))
+  dst)
+
+(defn- search
+  "Arrays.binarySearch over keys[0, len): index, or -(insertion point)-1."
+  ^long [keys ^long len key cmp]
+  (loop [lo 0 hi (dec len)]
+    (if (<= lo hi)
+      (let [mid (unsigned-bit-shift-right (+ lo hi) 1)
+            d (long (cmp (aget keys mid) key))]
+        (cond (neg? d) (recur (inc mid) hi)
+              (pos? d) (recur lo (dec mid))
+              :else mid))
+      (- (inc lo)))))
+
+(defn- search-first ^long [keys ^long len key cmp]
+  (loop [lo 0 hi len]
+    (if (< lo hi)
+      (let [mid (unsigned-bit-shift-right (+ lo hi) 1)]
+        (if (neg? (long (cmp (aget keys mid) key))) (recur (inc mid) hi) (recur lo mid)))
+      lo)))
+
+(defn- search-last ^long [keys ^long len key cmp]
+  (loop [lo 0 hi len]
+    (if (< lo hi)
+      (let [mid (unsigned-bit-shift-right (+ lo hi) 1)]
+        (if (<= (long (cmp (aget keys mid) key)) 0) (recur (inc mid) hi) (recur lo mid)))
+      (dec lo))))
+
+;; ---------------------------------------------------------------------------
+;; Nodes
+
+(declare branch? leaf? node-child node-count subtree-count)
+
+(deftype Leaf [^:unsynchronized-mutable _len _keys _settings]
+  INode
+  (len [_] _len)
+  (level [_] 0)
+  (keys [_] (vec (java.util.Arrays/copyOfRange _keys 0 _len)))
+  (maxKey [_] (aget _keys (dec _len)))
+  (minKey [_] (aget _keys 0))
+  (count [_ _] _len)
+  (searchFirst [_ key cmp] (search-first _keys _len key cmp))
+  (searchLast [_ key cmp] (search-last _keys _len key cmp))
+  (walkAddresses [_ _ _] nil)
+  (store [this storage] (.store ^IStorage storage this))
+  ISubtreeCount
+  (subtreeCount [_] _len)
+  Object
+  (toString [_] (str "#Leaf" (vec (java.util.Arrays/copyOfRange _keys 0 _len)))))
+
+;; _addresses / _children: arrays (or nil) with capacity >= _len.
+;; _subtreeCount: entries below, -1 when unknown.
+(deftype Branch [_level ^:unsynchronized-mutable _len _keys
+                 ^:unsynchronized-mutable _addresses ^:unsynchronized-mutable _children
+                 ^:unsynchronized-mutable _subtreeCount _settings]
+  INode
+  (len [_] _len)
+  (level [_] _level)
+  (keys [_] (vec (java.util.Arrays/copyOfRange _keys 0 _len)))
+  (maxKey [_] (aget _keys (dec _len)))
+  (minKey [_] (aget _keys 0))
+  (count [this storage]
+    (when (neg? _subtreeCount)
+      (set! _subtreeCount
+            (loop [i 0 acc 0]
+              (if (< i _len)
+                (recur (inc i) (+ acc (long (node-count (node-child this storage i) storage))))
+                acc))))
+    _subtreeCount)
+  (searchFirst [_ key cmp] (search-first _keys _len key cmp))
+  (searchLast [_ key cmp] (search-last _keys _len key cmp))
+  (walkAddresses [this storage on-address]
+    (dotimes [i _len]
+      (let [a (when _addresses (aget _addresses i))]
+        (when (or (nil? a) (on-address a))
+          (when (> _level 1)
+            (.walkAddresses ^INode (node-child this storage i) storage on-address))))))
+  (store [this storage]
+    (let [addrs (if _addresses
+                  (java.util.Arrays/copyOf _addresses (alength _keys))
+                  (object-array (alength _keys)))]
+      (dotimes [i _len]
+        (when (nil? (aget addrs i))
+          (aset addrs i (.store ^INode (aget _children i) storage))))
+      (set! _addresses addrs)
+      (.store ^IStorage storage this)))
+  IBranch
+  (address [_ i] (when _addresses (aget _addresses i)))
+  (addresses [_] (if _addresses
+                   (vec (java.util.Arrays/copyOfRange _addresses 0 _len))
+                   (vec (repeat _len nil))))
+  (child [this storage i] (node-child this storage i))
+  (slots [_] nil)
+  (slotsForStorage [_] nil)
+  ISubtreeCount
+  (subtreeCount [_] _subtreeCount)
+  Object
+  (toString [_] (str "#Branch{:level " _level " :len " _len "}")))
+
+(defn- leaf? [x] (instance? Leaf x))
+(defn- branch? [x] (instance? Branch x))
+
+(defn- node-len ^long [n] (if (leaf? n) (.-_len ^Leaf n) (.-_len ^Branch n)))
+(defn- node-keys [n] (if (leaf? n) (.-_keys ^Leaf n) (.-_keys ^Branch n)))
+(defn- node-settings [n] (if (leaf? n) (.-_settings ^Leaf n) (.-_settings ^Branch n)))
+(defn- node-max-key [n] (aget (node-keys n) (dec (node-len n))))
+(defn- node-editable? [n] (settings-editable? (node-settings n)))
+
+(defn- node-child
+  "Branch child i, restored from storage by address when not in memory."
+  [^Branch b storage ^long i]
+  (let [cs (.-_children b)
+        c (when cs (aget cs i))]
+    (if (some? c)
+      c
+      (let [n (.restore ^IStorage storage (aget (.-_addresses b) i))
+            cs (or cs (let [a (object-array (alength (.-_keys b)))] (set! (.-_children b) a) a))]
+        (aset cs i n)
+        n))))
+
+(defn- node-count ^long [n storage]
+  (if (leaf? n) (.-_len ^Leaf n) (.count ^Branch n storage)))
+
+(defn- subtree-count ^long [n]
+  (if (leaf? n) (.-_len ^Leaf n) (.-_subtreeCount ^Branch n)))
+
+(defn- children-count
+  "Sum of in-memory children's subtree counts, -1 if any is unknown or not in memory."
+  ^long [children ^long len]
+  (if (nil? children)
+    -1
+    (loop [i 0 acc 0]
+      (if (< i len)
+        (let [c (aget children i)]
+          (if (nil? c)
+            -1
+            (let [k (subtree-count c)] (if (neg? k) -1 (recur (inc i) (+ acc k))))))
+        acc))))
+
+(defn- new-leaf [^long len keys settings] (Leaf. len keys settings))
+
+(defn- leaf-of-len [^long len settings]
+  (Leaf. len (object-array (new-len len settings)) settings))
+
+(defn- new-branch [level ^long len keys addresses children ^long count settings]
+  (Branch. level len keys addresses children count settings))
+
+;; ---------------------------------------------------------------------------
+;; contains / lookup
+
+(defn- node-contains? [n storage key cmp]
+  (let [keys (node-keys n) len (node-len n)
+        idx (search keys len key cmp)]
+    (cond
+      (>= idx 0) true
+      (leaf? n) false
+      :else (let [ins (- (inc idx))]
+              (if (== ins len) false (recur (node-child n storage ins) storage key cmp))))))
+
+;; ---------------------------------------------------------------------------
+;; add
+
+(defn- leaf-add [^Leaf leaf storage key cmp ^Settings settings]
+  (let [keys (.-_keys leaf) len (.-_len leaf)
+        idx (search keys len key cmp)]
+    (if (>= idx 0)
+      UNCHANGED
+      (let [ins (- (inc idx))]
+        (if (and (settings-editable? (.-_settings leaf)) (< len (alength keys)))
+          (do (acopy keys ins len keys (inc ins))
+              (aset keys ins key)
+              (set! (.-_len leaf) (inc len))
+              (if (== ins len) (object-array [leaf]) EARLY_EXIT))
+          (let [total (inc len)
+                bf (.-_branchingFactor settings)]
+            (if (<= total bf)
+              (let [n (leaf-of-len total settings) nk (.-_keys n)]
+                (acopy keys 0 ins nk 0)
+                (aset nk ins key)
+                (acopy keys ins len nk (inc ins))
+                (object-array [n]))
+              ;; count boundary at level 0: ceil(total/bf) leaves of near-equal length (2 here)
+              (let [all (object-array total)
+                    _ (do (acopy keys 0 ins all 0) (aset all ins key) (acopy keys ins len all (inc ins)))
+                    half1 (unsigned-bit-shift-right total 1)
+                    l1 (leaf-of-len half1 settings)
+                    l2 (leaf-of-len (- total half1) settings)]
+                (acopy all 0 half1 (.-_keys l1) 0)
+                (acopy all half1 total (.-_keys l2) 0)
+                (object-array [l1 l2])))))))))
+
+(declare node-add)
+
+(defn- stitch
+  "Copies src[from,to) into dst at pos; returns the new pos."
+  ^long [src ^long from ^long to dst ^long pos]
+  (if (and src (< from to))
+    (do (System/arraycopy src from dst pos (- to from)) (+ pos (- to from)))
+    (+ pos (max 0 (- to from)))))
+
+(defn- branch-add [^Branch b storage key cmp ^Settings settings]
+  (let [keys (.-_keys b) len (.-_len b)
+        idx (search keys len key cmp)]
+    (if (>= idx 0)
+      UNCHANGED
+      (let [ins (let [i (- (inc idx))] (if (== i len) (dec len) i))
+            old-child (node-child b storage ins)
+            old-cc (subtree-count old-child)
+            nodes (node-add old-child storage key cmp settings)
+            cnt (.-_subtreeCount b)]
+        (cond
+          (identical? nodes UNCHANGED) UNCHANGED
+
+          (identical? nodes EARLY_EXIT)
+          (do (when (>= cnt 0) (set! (.-_subtreeCount b) (inc cnt))) EARLY_EXIT)
+
+          (== 1 (alength nodes))
+          (let [node (aget nodes 0)
+                nc (subtree-count node)
+                new-cnt (if (and (>= cnt 0) (>= old-cc 0) (>= nc 0)) (+ (- cnt old-cc) nc) -1)]
+            (if (settings-editable? (.-_settings b))
+              (do (aset keys ins (node-max-key node))
+                  (when-let [as (.-_addresses b)] (aset as ins nil))
+                  (let [cs (or (.-_children b)
+                               (let [a (object-array (alength keys))] (set! (.-_children b) a) a))]
+                    (aset cs ins node))
+                  (set! (.-_subtreeCount b) new-cnt)
+                  (if (== ins (dec len)) (object-array [b]) EARLY_EXIT))
+              (let [nk (java.util.Arrays/copyOfRange keys 0 len)
+                    _ (aset nk ins (node-max-key node))
+                    na (when-let [as (.-_addresses b)]
+                         (let [a (java.util.Arrays/copyOfRange as 0 len)] (aset a ins nil) a))
+                    nch (let [cs (.-_children b)
+                              a (if cs (java.util.Arrays/copyOfRange cs 0 len) (object-array len))]
+                          (aset a ins node) a)]
+                (object-array [(new-branch (.-_level b) len nk na nch new-cnt settings)]))))
+
+          :else
+          (let [n0 (aget nodes 0) n1 (aget nodes 1)
+                c01 (let [x (subtree-count n0) y (subtree-count n1)] (if (or (neg? x) (neg? y)) -1 (+ x y)))
+                new-cnt (if (and (>= cnt 0) (>= old-cc 0) (>= c01 0)) (+ (- cnt old-cc) c01) -1)
+                total (inc len)
+                all-k (object-array total)
+                all-a (when (.-_addresses b) (object-array total))
+                all-c (object-array total)
+                as (.-_addresses b) cs (.-_children b)]
+            (stitch keys 0 ins all-k 0)
+            (aset all-k ins (node-max-key n0)) (aset all-k (inc ins) (node-max-key n1))
+            (stitch keys (inc ins) len all-k (+ ins 2))
+            (when all-a
+              (stitch as 0 ins all-a 0)
+              (stitch as (inc ins) len all-a (+ ins 2)))
+            (when cs
+              (stitch cs 0 ins all-c 0)
+              (stitch cs (inc ins) len all-c (+ ins 2)))
+            (aset all-c ins n0) (aset all-c (inc ins) n1)
+            (if (<= total (.-_branchingFactor settings))
+              (object-array [(new-branch (.-_level b) total all-k all-a all-c new-cnt settings)])
+              (let [half1 (unsigned-bit-shift-right total 1)
+                    half2 (- total half1)
+                    k1 (java.util.Arrays/copyOfRange all-k 0 half1)
+                    k2 (java.util.Arrays/copyOfRange all-k half1 total)
+                    a1 (when all-a (java.util.Arrays/copyOfRange all-a 0 half1))
+                    a2 (when all-a (java.util.Arrays/copyOfRange all-a half1 total))
+                    ch1 (java.util.Arrays/copyOfRange all-c 0 half1)
+                    ch2 (java.util.Arrays/copyOfRange all-c half1 total)]
+                (object-array [(new-branch (.-_level b) half1 k1 a1 ch1 (children-count ch1 half1) settings)
+                               (new-branch (.-_level b) half2 k2 a2 ch2 (children-count ch2 half2) settings)])))))))))
+
+(defn- node-add [n storage key cmp settings]
+  (if (leaf? n) (leaf-add n storage key cmp settings) (branch-add n storage key cmp settings)))
+
+;; ---------------------------------------------------------------------------
+;; remove
+;;
+;; A node's remove takes its left and right siblings (nil at the edges) and returns
+;; [left' center' right'] (nil = that node was merged away), or UNCHANGED, or EARLY_EXIT.
+;; Rebalancing works on "entries": keys for a leaf; (key, address, child) for a branch.
+
+(defn- entries-of
+  "[keys addresses children len] of node n (addresses/children nil for a leaf)."
+  [n]
+  (if (leaf? n)
+    [(.-_keys ^Leaf n) nil nil (.-_len ^Leaf n)]
+    [(.-_keys ^Branch n) (.-_addresses ^Branch n) (.-_children ^Branch n) (.-_len ^Branch n)]))
+
+(defn- build-node
+  "A node like `proto` (leaf or branch at its level) from entries ks/as/cs [from,to) concatenated."
+  [proto parts settings]
+  (let [total (reduce + 0 (map (fn [[_ _ _ from to]] (- to from)) parts))
+        leaf (leaf? proto)
+        cap (new-len total settings)
+        nk (object-array cap)
+        na (when (and (not leaf) (some (fn [[_ as]] as) parts)) (object-array cap))
+        nc (when-not leaf (object-array cap))]
+    (loop [ps parts pos 0]
+      (when-let [[ks as cs from to] (first ps)]
+        (stitch ks from to nk pos)
+        (when na (stitch as from to na pos))
+        (when nc (stitch cs from to nc pos))
+        (recur (rest ps) (+ pos (- to from)))))
+    (if leaf
+      (Leaf. total nk settings)
+      (Branch. (.-_level ^Branch proto) total nk na nc (children-count nc total) settings))))
+
+(defn- rebalance
+  "Given the new center entries (ks as cs len), and this node's siblings left/right, return
+   [left' center' right'] per PSS's rules: keep, join with left, join with right, or
+   redistribute with the bigger sibling."
+  [proto left right [cks cas ccs clen] settings]
+  (let [bf (.-_branchingFactor ^Settings settings)
+        minbf (unsigned-bit-shift-right bf 1)
+        center-part [cks cas ccs 0 clen]]
+    (cond
+      (or (>= clen minbf) (and (nil? left) (nil? right)))
+      (object-array [left (build-node proto [center-part] settings) right])
+
+      (and left (<= (+ (node-len left) clen) bf))
+      (let [[lk la lc ll] (entries-of left)]
+        (object-array [nil (build-node proto [[lk la lc 0 ll] center-part] settings) right]))
+
+      (and right (<= (+ clen (node-len right)) bf))
+      (let [[rk ra rc rl] (entries-of right)]
+        (object-array [left (build-node proto [center-part [rk ra rc 0 rl]] settings) nil]))
+
+      (and left (or (nil? right) (>= (node-len left) (node-len right))))
+      (let [[lk la lc ll] (entries-of left)
+            total (+ ll clen)
+            new-left-len (unsigned-bit-shift-right total 1)]
+        (object-array [(build-node proto [[lk la lc 0 new-left-len]] settings)
+                       (build-node proto [[lk la lc new-left-len ll] center-part] settings)
+                       right]))
+
+      :else
+      (let [[rk ra rc rl] (entries-of right)
+            total (+ clen rl)
+            new-center-len (unsigned-bit-shift-right total 1)
+            right-head (- new-center-len clen)]
+        (object-array [left
+                       (build-node proto [center-part [rk ra rc 0 right-head]] settings)
+                       (build-node proto [[rk ra rc right-head rl]] settings)])))))
+
+(defn- leaf-remove [^Leaf leaf storage key left right cmp ^Settings settings]
+  (let [keys (.-_keys leaf) len (.-_len leaf)
+        idx (search keys len key cmp)]
+    (if (neg? idx)
+      UNCHANGED
+      (let [new-len (dec len)
+            minbf (unsigned-bit-shift-right (.-_branchingFactor settings) 1)]
+        (if (and (settings-editable? (.-_settings leaf))
+                 (or (>= new-len minbf) (and (nil? left) (nil? right))))
+          (do (acopy keys (inc idx) len keys idx)
+              (aset keys new-len nil)
+              (set! (.-_len leaf) new-len)
+              (if (== idx new-len) (object-array [left leaf right]) EARLY_EXIT))
+          (let [ck (object-array new-len)]
+            (acopy keys 0 idx ck 0)
+            (acopy keys (inc idx) len ck idx)
+            (rebalance leaf left right [ck nil nil new-len] settings)))))))
+
+(declare node-remove)
+
+(defn- branch-remove [^Branch b storage key left right cmp ^Settings settings]
+  (let [keys (.-_keys b) len (.-_len b)
+        idx (let [i (search keys len key cmp)] (if (neg? i) (- (inc i)) i))]
+    (if (== idx len)
+      UNCHANGED
+      (let [lchild (when (> idx 0) (node-child b storage (dec idx)))
+            rchild (when (< idx (dec len)) (node-child b storage (inc idx)))
+            llen (if lchild (node-len lchild) -1)
+            rlen (if rchild (node-len rchild) -1)
+            nodes (node-remove (node-child b storage idx) storage key lchild rchild cmp settings)
+            cnt (.-_subtreeCount b)]
+        (cond
+          (identical? nodes UNCHANGED) UNCHANGED
+          (identical? nodes EARLY_EXIT)
+          (do (when (>= cnt 0) (set! (.-_subtreeCount b) (dec cnt))) EARLY_EXIT)
+          :else
+          (let [n0 (aget nodes 0) n1 (aget nodes 1) n2 (aget nodes 2)
+                lchanged (or (not (identical? lchild n0)) (not= llen (if n0 (node-len n0) -1)))
+                rchanged (or (not (identical? rchild n2)) (not= rlen (if n2 (node-len n2) -1)))
+                as (.-_addresses b) cs (.-_children b)
+                start (max 0 (dec idx))
+                end (min len (+ idx 2))
+                mid-n (+ (if n0 1 0) 1 (if n2 1 0))
+                clen (+ start mid-n (- len end))
+                ck (object-array clen) ca (when as (object-array clen)) cc (object-array clen)]
+            (stitch keys 0 start ck 0)
+            (when ca (stitch as 0 start ca 0))
+            (when cs (stitch cs 0 start cc 0))
+            (loop [pos start
+                   triples [[n0 (when (and as (not lchanged) (> idx 0)) (aget as (dec idx)))]
+                            [n1 nil]
+                            [n2 (when (and as (not rchanged) (< idx (dec len))) (aget as (inc idx)))]]]
+              (if-let [[n a] (first triples)]
+                (if n
+                  (do (aset ck pos (node-max-key n))
+                      (when ca (aset ca pos a))
+                      (aset cc pos n)
+                      (recur (inc pos) (rest triples)))
+                  (recur pos (rest triples)))
+                (do (stitch keys end len ck pos)
+                    (when ca (stitch as end len ca pos))
+                    (when cs (stitch cs end len cc pos)))))
+            (let [r (rebalance b left right [ck ca cc clen] settings)
+                  c (aget r 1)]
+              ;; the rebuilt center's count: the old count minus one when it was known
+              (when (and (branch? c) (identical? (aget r 0) left) (identical? (aget r 2) right)
+                         (>= cnt 0))
+                (set! (.-_subtreeCount ^Branch c) (dec cnt)))
+              r)))))))
+
+(defn- node-remove [n storage key left right cmp settings]
+  (if (leaf? n)
+    (leaf-remove n storage key left right cmp settings)
+    (branch-remove n storage key left right cmp settings)))
+
+;; ---------------------------------------------------------------------------
+;; replace (oldKey and newKey compare equal under cmp)
+
+(defn- node-replace [n storage old-key new-key cmp settings]
+  (let [keys (node-keys n) len (node-len n)]
+    (if (leaf? n)
+      (let [idx (search keys len old-key cmp)]
+        (if (neg? idx)
+          UNCHANGED
+          (if (node-editable? n)
+            (do (aset keys idx new-key)
+                (if (== idx (dec len)) (object-array [n]) EARLY_EXIT))
+            (let [nl (leaf-of-len len settings)]
+              (acopy keys 0 len (.-_keys nl) 0)
+              (aset (.-_keys nl) idx new-key)
+              (object-array [nl])))))
+      (let [^Branch b n
+            idx (search-first keys len old-key cmp)]
+        (if (== idx len)
+          UNCHANGED
+          (let [nodes (node-replace (node-child b storage idx) storage old-key new-key cmp settings)]
+            (cond
+              (or (identical? nodes UNCHANGED) (identical? nodes EARLY_EXIT)) nodes
+              :else
+              (let [node (aget nodes 0)]
+                (if (node-editable? b)
+                  (do (aset keys idx (node-max-key node))
+                      (when-let [as (.-_addresses b)] (aset as idx nil))
+                      (aset (.-_children b) idx node)
+                      (if (== idx (dec len)) (object-array [b]) EARLY_EXIT))
+                  (let [nk (java.util.Arrays/copyOfRange keys 0 len)
+                        na (when-let [as (.-_addresses b)] (java.util.Arrays/copyOfRange as 0 len))
+                        nc (if-let [cs (.-_children b)] (java.util.Arrays/copyOfRange cs 0 len) (object-array len))]
+                    (aset nk idx (node-max-key node))
+                    (when na (aset na idx nil))
+                    (aset nc idx node)
+                    (object-array [(new-branch (.-_level b) len nk na nc (.-_subtreeCount b) settings)])))))))))))
+
+;; ---------------------------------------------------------------------------
+;; Seq: a cursor stack (parent = the Seq one level up, positioned at this node).
+
+(declare ->seq-slice ->seq-rslice seq-advance seq-reduce at-beginning? at-end?)
+
+(deftype Seq [_meta _set _parent _node ^long _idx _keyTo _cmp _asc ^long _version _leafSafe]
+  clojure.lang.ISeq
+  (first [_] (aget (node-keys _node) _idx))
+  (next [this] (seq-advance this))
+  (more [this] (or (seq-advance this) ()))
+  (cons [this o] (clojure.lang.Cons. o this))
+  clojure.lang.Seqable
+  (seq [this] this)
+  clojure.lang.Sequential
+  clojure.lang.IPersistentCollection
+  (count [this] (loop [s (seq-advance this) n 1] (if s (recur (seq-advance s) (inc n)) n)))
+  (empty [_] ())
+  (equiv [this o] (= (seq (vec this)) (seq o)))
+  clojure.lang.IMeta
+  (meta [_] _meta)
+  clojure.lang.IObj
+  (withMeta [_ m] (Seq. m _set _parent _node _idx _keyTo _cmp _asc _version _leafSafe))
+  clojure.lang.IReduceInit
+  (reduce [this f init] (seq-reduce this f init))
+  clojure.lang.IReduce
+  (reduce [this f]
+    (let [n (seq-advance this)]
+      (if n (seq-reduce n f (aget (node-keys _node) _idx)) (aget (node-keys _node) _idx))))
+  clojure.lang.Reversible
+  (rseq [this]
+    (if _asc
+      (.rslice ^IPersistentSortedSet _set _keyTo (when-not (at-beginning? this) (.first this)) _cmp)
+      (.slice ^IPersistentSortedSet _set _keyTo (when-not (at-end? this) (.first this)) _cmp)))
+  ISeek
+  (seek [this to] (.seek this to _cmp))
+  (seek [this to cmp]
+    (when (nil? to) (throw (ex-info "seek can't be called with a nil key!" {})))
+    (if _asc
+      (loop [seq _parent node _node]
+        (if (and node (neg? (long (cmp (node-max-key node) to))))
+          (if (nil? seq) nil (recur (.-_parent ^Seq seq) (.-_node ^Seq seq)))
+          (->seq-slice _set seq node to _keyTo cmp _version)))
+      (loop [seq _parent node _node]
+        (if (and (neg? (long (cmp to (aget (node-keys node) 0)))) seq)
+          (recur (.-_parent ^Seq seq) (.-_node ^Seq seq))
+          (->seq-rslice _set seq node to _keyTo cmp _version)))))
+  Object
+  (toString [this] (str (apply list this))))
+
+(defn- seq-over? [^Seq s]
+  (let [kt (.-_keyTo s)]
+    (if (nil? kt)
+      false
+      (let [d (long ((.-_cmp s) (aget (node-keys (.-_node s)) (.-_idx s)) kt))]
+        (if (.-_asc s) (pos? d) (neg? d))))))
+
+(defn- leaf-safe? [node key-to cmp asc]
+  (or (nil? key-to) (nil? cmp)
+      (if asc
+        (<= (long (cmp (node-max-key node) key-to)) 0)
+        (>= (long (cmp (aget (node-keys node) 0) key-to)) 0))))
+
+(defn- mk-seq [set parent node idx key-to cmp asc version]
+  (Seq. nil set parent node idx key-to cmp asc version (leaf-safe? node key-to cmp asc)))
+
+(defn- seq-storage [^Seq s] (.-_storage ^PersistentSortedSet (.-_set s)))
+
+(defn- check-version [^Seq s]
+  (when-not (== (.-_version s) (long (.-_version ^PersistentSortedSet (.-_set s))))
+    (throw (ex-info "Tovarisch, you are iterating and mutating a transient set at the same time!" {}))))
+
+(defn- seq-advance
+  "The Seq one step further (asc or desc), or nil at the end or past _keyTo."
+  [^Seq s]
+  (check-version s)
+  (let [node (.-_node s) idx (.-_idx s) asc (.-_asc s) len (node-len node)]
+    (if asc
+      (if (< idx (dec len))
+        (let [n (Seq. nil (.-_set s) (.-_parent s) node (inc idx) (.-_keyTo s) (.-_cmp s) true (.-_version s) (.-_leafSafe s))]
+          (when (or (.-_leafSafe s) (not (seq-over? n))) n))
+        (when-let [p (.-_parent s)]
+          (when-let [p' (seq-advance p)]
+            (let [child (node-child (.-_node ^Seq p') (seq-storage s) (.-_idx ^Seq p'))
+                  n (mk-seq (.-_set s) p' child 0 (.-_keyTo s) (.-_cmp s) true (.-_version s))]
+              (when (or (.-_leafSafe ^Seq n) (not (seq-over? n))) n)))))
+      (if (> idx 0)
+        (let [n (Seq. nil (.-_set s) (.-_parent s) node (dec idx) (.-_keyTo s) (.-_cmp s) false (.-_version s) (.-_leafSafe s))]
+          (when (or (.-_leafSafe s) (not (seq-over? n))) n))
+        (when-let [p (.-_parent s)]
+          (when-let [p' (seq-advance p)]
+            (let [child (node-child (.-_node ^Seq p') (seq-storage s) (.-_idx ^Seq p'))
+                  n (mk-seq (.-_set s) p' child (dec (node-len child)) (.-_keyTo s) (.-_cmp s) false (.-_version s))]
+              (when (or (.-_leafSafe ^Seq n) (not (seq-over? n))) n))))))))
+
+(defn- seq-reduce
+  "reduce f over this seq's remaining keys, walking leaf arrays directly."
+  [^Seq s f init]
+  (loop [^Seq s s acc init]
+    (if (nil? s)
+      acc
+      (let [node (.-_node s) keys (node-keys node) len (node-len node)
+            kt (.-_keyTo s) cmp (.-_cmp s) safe (.-_leafSafe s)]
+        (if (.-_asc s)
+          (let [[acc stop?]
+                (loop [i (.-_idx s) acc acc]
+                  (if (< i len)
+                    (let [k (aget keys i)]
+                      (if (and (not safe) kt (pos? (long (cmp k kt))))
+                        [acc true]
+                        (let [acc (f acc k)]
+                          (if (reduced? acc) [acc true] (recur (inc i) acc)))))
+                    [acc false]))]
+            (if stop?
+              (unreduced acc)
+              (recur (when-let [p (.-_parent s)]
+                       (when-let [p' (seq-advance p)]
+                         (mk-seq (.-_set s) p' (node-child (.-_node ^Seq p') (seq-storage s) (.-_idx ^Seq p'))
+                                 0 kt cmp true (.-_version s))))
+                     acc)))
+          (let [[acc stop?]
+                (loop [i (.-_idx s) acc acc]
+                  (if (>= i 0)
+                    (let [k (aget keys i)]
+                      (if (and (not safe) kt (neg? (long (cmp k kt))))
+                        [acc true]
+                        (let [acc (f acc k)]
+                          (if (reduced? acc) [acc true] (recur (dec i) acc)))))
+                    [acc false]))]
+            (if stop?
+              (unreduced acc)
+              (recur (when-let [p (.-_parent s)]
+                       (when-let [p' (seq-advance p)]
+                         (let [c (node-child (.-_node ^Seq p') (seq-storage s) (.-_idx ^Seq p'))]
+                           (mk-seq (.-_set s) p' c (dec (node-len c)) kt cmp false (.-_version s)))))
+                     acc))))))))
+
+(defn- at-beginning? [^Seq s]
+  (and (zero? (.-_idx s)) (or (nil? (.-_parent s)) (at-beginning? (.-_parent s)))))
+(defn- at-end? [^Seq s]
+  (and (== (.-_idx s) (dec (node-len (.-_node s)))) (or (nil? (.-_parent s)) (at-end? (.-_parent s)))))
+
+(defn- ->seq-slice
+  "Descend from node (under parent seq) to the first key >= from; nil if none or past key-to."
+  [set parent node from key-to cmp version]
+  (let [storage (.-_storage ^PersistentSortedSet set)]
+    (loop [seq parent node node]
+      (let [idx (if (nil? from) 0 (search-first (node-keys node) (node-len node) from cmp))]
+        (if (== idx (node-len node))
+          nil
+          (if (branch? node)
+            (let [s (Seq. nil set seq node idx nil nil true version true)]
+              (recur s (node-child node storage idx)))
+            (let [s (mk-seq set seq node idx key-to cmp true version)]
+              (when-not (seq-over? s) s))))))))
+
+(defn- ->seq-rslice
+  "Descend to the last key <= from (from nil = the last key); nil if none or past key-to."
+  [set parent node from key-to cmp version]
+  (let [storage (.-_storage ^PersistentSortedSet set)]
+    (loop [seq parent node node]
+      (let [len (node-len node)]
+        (if (branch? node)
+          (let [idx (if (nil? from) (dec len)
+                        (let [i (inc (search-last (node-keys node) len from cmp))] (if (== i len) (dec i) i)))
+                s (Seq. nil set seq node idx nil nil false version true)]
+            (recur s (node-child node storage idx)))
+          (if (nil? from)
+            (let [s (mk-seq set seq node (dec len) key-to cmp false version)]
+              (when-not (seq-over? s) s))
+            (let [idx (search-last (node-keys node) len from cmp)]
+              (if (== idx -1)
+                (seq-advance (mk-seq set seq node 0 key-to cmp false version))
+                (let [s (mk-seq set seq node idx key-to cmp false version)]
+                  (when-not (seq-over? s) s))))))))))
+
+;; ---------------------------------------------------------------------------
+;; ForwardCursor (the JVM fast path of datahike.query.execute)
+
+(deftype ForwardCursor [_set _cmp ^:unsynchronized-mutable _leaf ^:unsynchronized-mutable _leafIdx
+                        _branches _branchIdxs _depth]
+  IForwardCursor
+  (seekGE [this key]
+    (when _leaf
+      (let [storage (.-_storage ^PersistentSortedSet _set)
+            cmp _cmp
+            leaf-hit (when (<= (long (cmp key (node-max-key _leaf))) 0)
+                       (let [idx (search-first (node-keys _leaf) (node-len _leaf) key cmp)
+                             idx (max idx _leafIdx)
+                             idx (if (and (< idx (node-len _leaf))
+                                          (neg? (long (cmp (aget (node-keys _leaf) idx) key))))
+                                   (search-first (node-keys _leaf) (node-len _leaf) key cmp)
+                                   idx)]
+                         (when (< idx (node-len _leaf))
+                           (set! _leafIdx idx)
+                           (aget (node-keys _leaf) idx))))]
+        (or leaf-hit
+            (loop [level (dec _depth)]
+              (if (< level 0)
+                (do (set! _leaf nil) nil)
+                (let [^Branch br (aget _branches level)
+                      found (loop [bi (inc (aget _branchIdxs level))]
+                              (when (< bi (.-_len br))
+                                (if (<= (long (cmp key (aget (.-_keys br) bi))) 0)
+                                  (do (aset _branchIdxs level bi)
+                                      (let [node (loop [d (inc level) node (node-child br storage bi)]
+                                                   (if (< d _depth)
+                                                     (let [ci (min (search-first (node-keys node) (node-len node) key cmp)
+                                                                   (dec (node-len node)))]
+                                                       (aset _branches d node)
+                                                       (aset _branchIdxs d ci)
+                                                       (recur (inc d) (node-child node storage ci)))
+                                                     node))]
+                                        (set! _leaf node)
+                                        (let [idx (search-first (node-keys node) (node-len node) key cmp)]
+                                          (if (< idx (node-len node))
+                                            (do (set! _leafIdx idx) (aget (node-keys node) idx))
+                                            (recur (inc bi))))))
+                                  (recur (inc bi)))))]
+                  (or found (recur (dec level))))))))))
+  (next [this]
+    (when _leaf
+      (set! _leafIdx (inc _leafIdx))
+      (if (< _leafIdx (node-len _leaf))
+        (aget (node-keys _leaf) _leafIdx)
+        (let [storage (.-_storage ^PersistentSortedSet _set)]
+          (loop [level (dec _depth)]
+            (if (< level 0)
+              (do (set! _leaf nil) nil)
+              (let [bi (inc (aget _branchIdxs level)) ^Branch br (aget _branches level)]
+                (if (< bi (.-_len br))
+                  (do (aset _branchIdxs level bi)
+                      (let [node (loop [d (inc level) node (node-child br storage bi)]
+                                   (if (< d _depth)
+                                     (do (aset _branches d node) (aset _branchIdxs d 0)
+                                         (recur (inc d) (node-child node storage 0)))
+                                     node))]
+                        (set! _leaf node) (set! _leafIdx 0)
+                        (aget (node-keys node) 0)))
+                  (recur (dec level))))))))))
+  (current [_]
+    (when (and _leaf (>= _leafIdx 0) (< _leafIdx (node-len _leaf)))
+      (aget (node-keys _leaf) _leafIdx))))
+
+;; ---------------------------------------------------------------------------
+;; The set
+
+(declare grow-root count-slice-node)
+
+(deftype PersistentSortedSet [_meta _cmp ^:unsynchronized-mutable _address ^:unsynchronized-mutable _storage
+                              ^:unsynchronized-mutable _root ^:unsynchronized-mutable _count
+                              ^:unsynchronized-mutable _settings ^:unsynchronized-mutable _version]
+  IPersistentSortedSet
+  (root [this]
+    (when (and (nil? _root) (some? _address))
+      (set! _root (.restore ^IStorage _storage _address)))
+    _root)
+  (comparator [_] _cmp)
+  (hasSubtreeCounts [this] (>= (subtree-count (.root this)) 0))
+  (cons [this key cmp]
+    (when (nil? key) (throw (ex-info "PersistentSortedSet cannot store nil" {})))
+    (let [nodes (node-add (.root this) _storage key cmp _settings)]
+      (if (identical? nodes UNCHANGED)
+        this
+        (do
+          (when (and _storage _address) (.markFreed ^IStorage _storage _address))
+          (if (settings-editable? _settings)
+            (do (set! _address nil)
+                (cond (== 1 (alength nodes)) (set! _root (aget nodes 0))
+                      (>= (alength nodes) 2) (set! _root (grow-root nodes _settings)))
+                (when (>= _count 0) (set! _count (inc _count)))
+                (set! _version (inc _version))
+                this)
+            (let [new-root (if (== 1 (alength nodes)) (aget nodes 0) (grow-root nodes _settings))
+                  rc (subtree-count new-root)]
+              (PersistentSortedSet. _meta _cmp nil _storage new-root (if (>= rc 0) rc -1) _settings (inc _version))))))))
+  (disjoin [this key cmp]
+    (let [nodes (node-remove (.root this) _storage key nil nil cmp _settings)]
+      (cond
+        (identical? nodes UNCHANGED) this
+        :else
+        (do
+          (when (and _storage _address) (.markFreed ^IStorage _storage _address))
+          (if (identical? nodes EARLY_EXIT)
+            (do (set! _address nil)
+                (when (>= _count 0) (set! _count (dec _count)))
+                (set! _version (inc _version))
+                this)
+            (let [nr (aget nodes 1)
+                  nr (if (and (branch? nr) (== 1 (node-len nr))) (node-child nr _storage 0) nr)]
+              (if (settings-editable? _settings)
+                (do (set! _address nil) (set! _root nr)
+                    (when (>= _count 0) (set! _count (dec _count)))
+                    (set! _version (inc _version))
+                    this)
+                (let [rc (subtree-count nr)]
+                  (PersistentSortedSet. _meta _cmp nil _storage nr (if (>= rc 0) rc -1) _settings (inc _version))))))))))
+  (replace [this old new] (.replace this old new _cmp))
+  (replace [this old new cmp]
+    (let [nodes (node-replace (.root this) _storage old new cmp _settings)]
+      (cond
+        (identical? nodes UNCHANGED) this
+        :else
+        (do (when (and _storage _address) (.markFreed ^IStorage _storage _address))
+            (cond
+              (identical? nodes EARLY_EXIT)
+              (do (set! _address nil) (set! _version (inc _version)) this)
+              (settings-editable? _settings)
+              (do (set! _address nil) (set! _root (aget nodes 0)) (set! _version (inc _version)) this)
+              :else
+              (PersistentSortedSet. _meta _cmp nil _storage (aget nodes 0) _count _settings (inc _version)))))))
+  (lookup [this key] (.lookup this key _cmp))
+  (lookup [this key cmp]
+    (loop [node (.root this)]
+      (let [len (node-len node)]
+        (when (pos? len)
+          (let [idx (search-first (node-keys node) len key cmp)]
+            (when (< idx len)
+              (if (branch? node)
+                (recur (node-child node _storage idx))
+                (let [k (aget (node-keys node) idx)]
+                  (when (zero? (long (cmp k key))) k)))))))))
+  (lookupGE [this key] (.lookupGE this key _cmp))
+  (lookupGE [this key cmp]
+    (loop [node (.root this)]
+      (let [len (node-len node)]
+        (when (pos? len)
+          (let [idx (search-first (node-keys node) len key cmp)]
+            (when (< idx len)
+              (if (branch? node)
+                (recur (node-child node _storage idx))
+                (aget (node-keys node) idx))))))))
+  (slice [this from to] (.slice this from to _cmp))
+  (slice [this from to cmp]
+    (let [root (.root this)]
+      (when (pos? (node-len root))
+        (->seq-slice this nil root from to cmp _version))))
+  (rslice [this from to] (.rslice this from to _cmp))
+  (rslice [this from to cmp]
+    (let [root (.root this)]
+      (when (pos? (node-len root))
+        (->seq-rslice this nil root from to cmp _version))))
+  (countSlice [this from to] (.countSlice this from to _cmp))
+  (countSlice [this from to cmp]
+    (if (and from to (pos? (long (cmp from to))))
+      0
+      (let [root (.root this)]
+        (if (zero? (node-len root)) 0 (count-slice-node root _storage from to cmp)))))
+  (walkAddresses [this on-address]
+    (when (or (nil? _address) (on-address _address))
+      (.walkAddresses ^INode (.root this) _storage on-address)))
+  (store [this]
+    (when (nil? _address)
+      (set! _address (.store ^INode _root _storage)))
+    _address)
+  (store [this storage] (set! _storage storage) (.store this))
+  (forwardCursor [this] (.forwardCursor this _cmp))
+  (forwardCursor [this cmp]
+    (let [root (.root this)]
+      (if (zero? (node-len root))
+        (ForwardCursor. this cmp nil 0 nil nil 0)
+        (let [height (loop [n root h 0] (if (branch? n) (recur (node-child n _storage 0) (inc h)) h))
+              branches (object-array height)
+              idxs (int-array height)
+              leaf (loop [n root lvl 0]
+                     (if (< lvl height)
+                       (do (aset branches lvl n) (recur (node-child n _storage 0) (inc lvl)))
+                       n))]
+          (ForwardCursor. this cmp leaf 0 branches idxs height)))))
+
+  clojure.lang.IPersistentSet
+  (disjoin [this key] (.disjoin this key _cmp))
+  (contains [this key] (node-contains? (.root this) _storage key _cmp))
+  (get [this key] (when (node-contains? (.root this) _storage key _cmp) key))
+  clojure.lang.IPersistentCollection
+  (count [this]
+    (when (neg? _count) (set! _count (node-count (.root this) _storage)))
+    _count)
+  (cons [this key] (.cons this key _cmp))
+  (empty [this] (PersistentSortedSet. _meta _cmp nil _storage (Leaf. 0 (object-array 0) _settings) 0 _settings 0))
+  (equiv [this o]
+    (and (set? o) (== (count this) (count o))
+         (every? #(contains? o %) (seq this))))
+  clojure.lang.Counted
+  clojure.lang.Seqable
+  (seq [this] (.slice this nil nil _cmp))
+  clojure.lang.Reversible
+  (rseq [this] (.rslice this nil nil _cmp))
+  clojure.lang.ILookup
+  (valAt [this k] (.get this k))
+  (valAt [this k nf] (if (.contains this k) k nf))
+  clojure.lang.IFn
+  (invoke [this k] (.get this k))
+  (invoke [this k nf] (if (.contains this k) k nf))
+  clojure.lang.IMeta
+  (meta [_] _meta)
+  clojure.lang.IObj
+  (withMeta [this m]
+    (if (identical? m _meta) this
+        (PersistentSortedSet. m _cmp _address _storage _root _count _settings _version)))
+  clojure.lang.IEditableCollection
+  (asTransient [this]
+    (when (settings-editable? _settings) (throw (ex-info "Expected persistent set" {})))
+    (PersistentSortedSet. _meta _cmp _address _storage _root _count
+                          (Settings. (.-_branchingFactor ^Settings _settings) (volatile! true) 0) _version))
+  clojure.lang.ITransientSet
+  (conj [this key] (.cons this key _cmp))
+  (persistent [this]
+    (when-not (settings-editable? _settings) (throw (ex-info "Expected transient set" {})))
+    (vreset! (.-_edit ^Settings _settings) false)
+    this)
+  clojure.lang.IReduceInit
+  (reduce [this f init] (if-let [s (.slice this nil nil _cmp)] (seq-reduce s f init) init))
+  clojure.lang.IHashEq
+  (hasheq [this] (hash-unordered-coll (seq this)))
+  Object
+  (hashCode [this] (reduce (fn [h k] (+ h (hash k))) 0 this))
+  (equals [this o] (.equiv this o))
+  (toString [this] (str "#{" (clojure.string/join " " (map str this)) "}")))
+
+(defmethod print-method PersistentSortedSet [s ^java.io.Writer w]
+  (.write w (str "#{" (clojure.string/join " " (map pr-str s)) "}")))
+
+(defn- grow-root [nodes settings]
+  (let [n (alength nodes)
+        keys (object-array n)
+        children (object-array n)]
+    (dotimes [i n]
+      (aset keys i (node-max-key (aget nodes i)))
+      (aset children i (aget nodes i)))
+    (Branch. (inc (if (leaf? (aget nodes 0)) 0 (.-_level ^Branch (aget nodes 0))))
+             n keys nil children (children-count children n) settings)))
+
+(defn- count-slice-node ^long [node storage from to cmp]
+  (let [len (node-len node) keys (node-keys node)]
+    (if (leaf? node)
+      (let [fi (if from (search-first keys len from cmp) 0)
+            ti (if to (search-last keys len to cmp) (dec len))]
+        (if (or (>= fi len) (neg? ti)) 0 (max 0 (inc (- ti fi)))))
+      (let [fi (if from (min (search-first keys len from cmp) (dec len)) 0)
+            ti (if to (max 0 (min (inc (search-last keys len to cmp)) (dec len))) (dec len))]
+        (if (== fi ti)
+          (count-slice-node (node-child node storage fi) storage from to cmp)
+          (+ (count-slice-node (node-child node storage fi) storage from nil cmp)
+             (loop [i (inc fi) acc 0]
+               (if (< i ti)
+                 (let [c (node-child node storage i) k (subtree-count c)]
+                   (recur (inc i) (+ acc (if (>= k 0) k (node-count c storage)))))
+                 acc))
+             (count-slice-node (node-child node storage ti) storage nil to cmp)))))))
+
+;; ---------------------------------------------------------------------------
+;; Public API (the jar's org/replikativ/persistent_sorted_set.clj, same names and arities)
+
+(defn conj [^PersistentSortedSet set key cmp] (.cons set key cmp))
+(defn disj [^PersistentSortedSet set key cmp] (.disjoin set key cmp))
+
+(defn slice
+  ([^PersistentSortedSet set from to] (.slice set from to))
+  ([^PersistentSortedSet set from to cmp] (.slice set from to cmp)))
+
+(defn rslice
+  ([^PersistentSortedSet set from to] (.rslice set from to))
+  ([^PersistentSortedSet set from to cmp] (.rslice set from to cmp)))
+
+(defn count-slice
+  ([^PersistentSortedSet set from to] (.countSlice set from to))
+  ([^PersistentSortedSet set from to cmp] (.countSlice set from to cmp)))
+
+(defn has-subtree-counts? [^PersistentSortedSet set] (.hasSubtreeCounts set))
+
+(defn seek
+  ([seq to] (when seq (.seek ^Seq seq to)))
+  ([seq to cmp] (when seq (.seek ^Seq seq to cmp))))
+
+(defn lookup
+  ([^PersistentSortedSet set key] (.lookup set key))
+  ([^PersistentSortedSet set key cmp] (.lookup set key cmp)))
+
+(defn replace
+  ([^PersistentSortedSet set old-key new-key] (.replace set old-key new-key))
+  ([^PersistentSortedSet set old-key new-key cmp] (.replace set old-key new-key cmp)))
+
+(defn- map->settings ^Settings [m]
+  (make-settings (or (:branching-factor m) 0)))
+
+(defn- settings->map [^Settings s]
+  {:branching-factor (.-_branchingFactor s) :ref-type :strong :measure nil :leaf-processor nil
+   :diff-buf-size 0})
+
+(defn- split-arrays
+  "PSS's bulk split: chunks of avg length while at least 2*avg remain, then one or two."
+  [arr ^long len ^long avg ^long mx]
+  (loop [from 0 res (transient [])]
+    (let [n (- len from)]
+      (cond
+        (== 0 n) (persistent! res)
+        (>= n (* 2 avg)) (recur (+ from avg) (conj! res (java.util.Arrays/copyOfRange arr from (+ from avg))))
+        (<= n mx) (persistent! (conj! res (java.util.Arrays/copyOfRange arr from len)))
+        :else (let [h (quot n 2)]
+                (persistent! (-> res
+                                 (conj! (java.util.Arrays/copyOfRange arr from (+ from h)))
+                                 (conj! (java.util.Arrays/copyOfRange arr (+ from h) len)))))))))
+
+(defn from-sorted-array
+  ([cmp keys] (from-sorted-array cmp keys (arrays/alength keys) {}))
+  ([cmp keys len] (from-sorted-array cmp keys len {}))
+  ([cmp keys len opts]
+   (let [settings (map->settings opts)
+         mx (.-_branchingFactor settings)
+         avg (quot (+ (unsigned-bit-shift-right mx 1) mx) 2)
+         storage (:storage opts)
+         arr (if (arrays/array? keys) keys (to-array keys))]
+     (loop [level 1
+            nodes (mapv (fn [^objects ks] (Leaf. (alength ks) ks settings))
+                        (split-arrays arr len avg mx))]
+       (case (count nodes)
+         0 (PersistentSortedSet. nil cmp nil storage (Leaf. 0 (object-array 0) settings) 0 settings 0)
+         1 (PersistentSortedSet. nil cmp nil storage (first nodes) len settings 0)
+         (recur (inc level)
+                (mapv (fn [^objects children]
+                        (let [n (alength children)
+                              ks (object-array n)]
+                          (dotimes [i n] (aset ks i (node-max-key (aget children i))))
+                          (Branch. level n ks nil children (children-count children n) settings)))
+                      (split-arrays (to-array nodes) (count nodes) avg mx))))))))
+
+(declare dedupe-by-cmp)
+(defn from-sequential
+  ([cmp keys] (from-sequential cmp keys {}))
+  ([cmp keys opts]
+   (when (some nil? keys) (throw (ex-info "PersistentSortedSet cannot store nil" {})))
+   (let [sorted (vec (dedupe-by-cmp cmp (sort cmp keys)))]
+     (from-sorted-array cmp (to-array sorted) (count sorted) opts))))
+
+(defn- dedupe-by-cmp [cmp xs]
+  (let [out (java.util.ArrayList.)]
+    (doseq [x xs]
+      (when (or (zero? (.size out)) (not (zero? (long (cmp (.get out (dec (.size out))) x)))))
+        (.add out x)))
+    out))
+
+(defn sorted-set* [opts]
+  (let [settings (map->settings opts)]
+    (PersistentSortedSet. (:meta opts) (or (:comparator opts) (:cmp opts) compare) nil (:storage opts)
+                          (Leaf. 0 (object-array 0) settings) 0 settings 0)))
+
+(defn sorted-set-by
+  ([cmp] (sorted-set* {:comparator cmp}))
+  ([cmp & keys] (from-sequential cmp keys)))
+
+(defn sorted-set
+  ([] (sorted-set* {}))
+  ([& keys] (from-sequential compare keys)))
+
+(defn restore-by
+  ([cmp address storage] (restore-by cmp address storage {}))
+  ([cmp address storage opts]
+   (PersistentSortedSet. nil cmp address storage nil -1 (map->settings opts) 0)))
+
+(defn restore
+  ([address storage] (restore-by compare address storage {}))
+  ([address storage opts] (restore-by compare address storage opts)))
+
+(defn walk-addresses [^PersistentSortedSet set consume-fn] (.walkAddresses set consume-fn))
+
+(defn store
+  ([^PersistentSortedSet set] (.store set))
+  ([^PersistentSortedSet set storage] (.store set storage)))
+
+(defn settings [^PersistentSortedSet set] (settings->map (.-_settings set)))
+
+;; Node constructors for storage read handlers (ANode.restore in the Java)
+(defn restore-node
+  "A Leaf (level 0 or no addresses) or a Branch from stored keys/addresses."
+  ([level keys addresses settings] (restore-node level keys addresses -1 settings))
+  ([level keys addresses subtree-count settings]
+   (let [ks (to-array keys) n (alength ks)]
+     (if (or (zero? level) (nil? addresses))
+       (Leaf. n ks settings)
+       (Branch. level n ks (to-array addresses) nil (long (or subtree-count -1)) settings)))))
+
+(defn default-settings [bf] (make-settings bf))
