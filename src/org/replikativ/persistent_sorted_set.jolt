@@ -1140,16 +1140,44 @@
 ;; EDN form of stored nodes (konserve StringSerializer on Jolt; the JVM uses Fressian).
 ;; Tags have no dot in their namespace: Jolt's clojure.edn ignores :readers for #a.b/T.
 
+;; Nodes are written by a direct emitter rather than the generic printer: Jolt's
+;; print-method path costs ~0.19 us per output byte (konserve-on-jolt.md), the emitter
+;; ~0.01 (proto/core dev/pb.clj: 64 datoms, 748 -> 35 us), and a commit writes every
+;; node it touched. A datahike.datom.Datom key is written as #datahike/Datom [e a v tx
+;; added], byte for byte what its print-method writes; any other key goes through pr-str.
+
+(defn- emit-value [^StringBuilder sb v]
+  (cond (string? v) (.append sb (pr-str v))
+        (or (keyword? v) (symbol? v) (int? v) (boolean? v)) (.append sb (str v))
+        :else (.append sb (pr-str v))))
+
+(defn- emit-key [^StringBuilder sb k]
+  (if (= "datahike.datom.Datom" (.getName (class k)))
+    (let [tx (.-tx k)]
+      (.append sb "#datahike/Datom [") (.append sb (str (.-e k))) (.append sb " ")
+      (emit-value sb (.-a k)) (.append sb " ") (emit-value sb (.-v k)) (.append sb " ")
+      (.append sb (str (if (pos? tx) tx (- tx)))) (.append sb (if (pos? tx) " true]" " false]")))
+    (.append sb (pr-str k))))
+
+(defn- emit-keys [^StringBuilder sb ^objects ks n]
+  (.append sb "[")
+  (dotimes [i n] (when (pos? i) (.append sb " ")) (emit-key sb (aget ks i)))
+  (.append sb "]"))
+
 (defmethod print-method Leaf [^Leaf n ^java.io.Writer w]
-  (.write w "#pss/leaf ")
-  (print-method (vec (java.util.Arrays/copyOfRange (.-_keys n) 0 (.-_len n))) w))
+  (let [sb (StringBuilder.)]
+    (.append sb "#pss/leaf ")
+    (emit-keys sb (.-_keys n) (.-_len n))
+    (.write w (.toString sb))))
 
 (defmethod print-method Branch [^Branch n ^java.io.Writer w]
-  (.write w "#pss/branch ")
-  (print-method {:level (.-_level n)
-                 :keys (vec (java.util.Arrays/copyOfRange (.-_keys n) 0 (.-_len n)))
-                 :addresses (.addresses n)
-                 :subtree-count (.-_subtreeCount n)} w))
+  (let [sb (StringBuilder.)]
+    (.append sb "#pss/branch {:level ") (.append sb (str (.-_level n)))
+    (.append sb ", :keys ") (emit-keys sb (.-_keys n) (.-_len n))
+    (.append sb ", :addresses ") (.append sb (pr-str (.addresses n)))
+    (.append sb ", :subtree-count ") (.append sb (str (.-_subtreeCount n)))
+    (.append sb "}")
+    (.write w (.toString sb))))
 
 (defn edn-read-handlers
   "EDN tag readers for stored nodes; settings is the store's (branching factor)."
