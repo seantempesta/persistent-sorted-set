@@ -913,7 +913,10 @@
   (store [this storage] (set! _storage storage) (.store this))
   (forwardCursor [this] (.forwardCursor this _cmp))
   (forwardCursor [this cmp]
-    (let [root (.root this)]
+    ;; cmp may be a java.util.Comparator, as on the JVM (datahike.query.execute's fast-cmp-ea):
+    ;; the cursor calls its comparator as a fn, so one is made from .compare
+    (let [cmp (if (fn? cmp) cmp (fn [a b] (.compare ^java.util.Comparator cmp a b)))
+          root (.root this)]
       (if (zero? (node-len root))
         (ForwardCursor. this cmp nil 0 nil nil 0)
         (let [height (loop [n root h 0] (if (branch? n) (recur (node-child n _storage 0) (inc h)) h))
