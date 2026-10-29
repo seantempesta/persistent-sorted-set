@@ -75,15 +75,19 @@
 (definterface IForwardCursor (seekGE [key]) (next []) (current []))
 
 ;; Settings: branching factor and the transient edit flag (a volatile holding true while the
-;; transient session that created a node is open; nil for persistent nodes).
-(deftype Settings [_branchingFactor _edit _diffBufSize])
+;; transient session that created a node is open; nil for persistent nodes) and the ref type.
+;; _refType :weak (Datahike sets it when it caches nodes by their bytes): a branch does not keep a
+;; child it restored from storage, so the storage's cache is the one holder of nodes read back and
+;; an evicted node is freed (node-child). nil: a branch memoizes the children it restores.
+(deftype Settings [_branchingFactor _edit _diffBufSize _refType])
 
 (defn- settings-editable? [^Settings s]
   (let [e (.-_edit s)] (and (some? e) @e)))
 
 (defn- make-settings
   ([] (make-settings 512))
-  ([bf] (Settings. (if (and bf (pos? bf)) (int bf) 512) nil 0)))
+  ([bf] (make-settings bf nil))
+  ([bf ref-type] (Settings. (if (and bf (pos? bf)) (int bf) 512) nil 0 (when (#{:weak :soft} ref-type) :weak))))
 
 (def ^:private ^:const expand-len 8)
 
@@ -210,15 +214,18 @@
 (defn- node-editable? [n] (settings-editable? (node-settings n)))
 
 (defn- node-child
-  "Branch child i, restored from storage by address when not in memory."
+  "Branch child i, restored from storage by address when not in memory. Under :weak settings
+  the restored child is not kept in the branch (the storage's cache holds it), so a cached
+  branch retains its own keys and addresses and no subtree."
   [^Branch b storage ^long i]
   (let [cs (.-_children b)
         c (when cs (aget cs i))]
     (if (some? c)
       c
-      (let [n (.restore ^IStorage storage (aget (.-_addresses b) i))
-            cs (or cs (let [a (object-array (alength (.-_keys b)))] (set! (.-_children b) a) a))]
-        (aset cs i n)
+      (let [n (.restore ^IStorage storage (aget (.-_addresses b) i))]
+        (when-not (= :weak (.-_refType ^Settings (.-_settings b)))
+          (let [cs (or cs (let [a (object-array (alength (.-_keys b)))] (set! (.-_children b) a) a))]
+            (aset cs i n)))
         n))))
 
 (defn- node-count ^long [n storage]
@@ -962,7 +969,7 @@
   (asTransient [this]
     (when (settings-editable? _settings) (throw (ex-info "Expected persistent set" {})))
     (PersistentSortedSet. _meta _cmp _address _storage _root _count
-                          (Settings. (.-_branchingFactor ^Settings _settings) (volatile! true) 0) _version))
+                          (Settings. (.-_branchingFactor ^Settings _settings) (volatile! true) 0 (.-_refType ^Settings _settings)) _version))
   clojure.lang.ITransientSet
   (conj [this key] (.cons this key _cmp))
   (persistent [this]
@@ -1039,10 +1046,10 @@
   ([^PersistentSortedSet set old-key new-key cmp] (.replace set old-key new-key cmp)))
 
 (defn- map->settings ^Settings [m]
-  (make-settings (or (:branching-factor m) 0)))
+  (make-settings (or (:branching-factor m) 0) (:ref-type m)))
 
 (defn- settings->map [^Settings s]
-  {:branching-factor (.-_branchingFactor s) :ref-type :strong :measure nil :leaf-processor nil
+  {:branching-factor (.-_branchingFactor s) :ref-type (or (.-_refType s) :strong) :measure nil :leaf-processor nil
    :diff-buf-size 0})
 
 (defn- split-arrays
@@ -1137,7 +1144,9 @@
        (Leaf. n ks settings)
        (Branch. level n ks (to-array addresses) nil (long (or subtree-count -1)) settings)))))
 
-(defn default-settings [bf] (make-settings bf))
+(defn default-settings
+  ([bf] (make-settings bf))
+  ([bf ref-type] (make-settings bf ref-type)))
 
 ;; ---------------------------------------------------------------------------
 ;; EDN form of stored nodes (konserve StringSerializer on Jolt; the JVM uses Fressian).
