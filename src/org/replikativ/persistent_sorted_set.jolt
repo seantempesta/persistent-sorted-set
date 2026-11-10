@@ -133,6 +133,13 @@
         (if (<= (long (cmp (aget keys mid) key)) 0) (recur (inc mid) hi) (recur lo mid)))
       (dec lo))))
 
+;; search's contract (index, or -(insertion point)-1) but the LEFTMOST of several keys cmp calls
+;; equal, as lookup takes (upstream ANode.searchFirstEq): binarySearch disclaims which equal key
+;; it finds, so disj or replace under a coarse cmp could act on another element than lookup's.
+(defn- search-first-eq ^long [keys ^long len key cmp]
+  (let [i (search-first keys len key cmp)]
+    (if (and (< i len) (zero? (long (cmp (aget keys i) key)))) i (- (inc i)))))
+
 ;; ---------------------------------------------------------------------------
 ;; Nodes
 
@@ -460,7 +467,7 @@
 
 (defn- leaf-remove [^Leaf leaf storage key left right cmp ^Settings settings]
   (let [keys (.-_keys leaf) len (.-_len leaf)
-        idx (search keys len key cmp)]
+        idx (search-first-eq keys len key cmp)]
     (if (neg? idx)
       UNCHANGED
       (let [new-len (dec len)
@@ -480,7 +487,7 @@
 
 (defn- branch-remove [^Branch b storage key left right cmp ^Settings settings]
   (let [keys (.-_keys b) len (.-_len b)
-        idx (let [i (search keys len key cmp)] (if (neg? i) (- (inc i)) i))]
+        idx (search-first keys len key cmp)]
     (if (== idx len)
       UNCHANGED
       (let [lchild (when (> idx 0) (node-child b storage (dec idx)))
@@ -542,7 +549,7 @@
 (defn- node-replace [n storage old-key new-key cmp settings]
   (let [keys (node-keys n) len (node-len n)]
     (if (leaf? n)
-      (let [idx (search keys len old-key cmp)]
+      (let [idx (search-first-eq keys len old-key cmp)]
         (if (neg? idx)
           UNCHANGED
           (if (node-editable? n)

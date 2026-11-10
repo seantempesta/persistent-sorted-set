@@ -71,3 +71,26 @@
           model (vec (for [k (range 10000)] (if (< k 640) [k (inc (quot k 32))] [k 0])))]
       (is (= model in-memory))
       (is (= model reloaded) "the reloaded set holds every replacement made after a store"))))
+
+;; ---- disj/replace and lookup disagreed on which comparator-equal element they act on --------
+;; CHANGES.md 0.5.x: lookup takes the LEFTMOST element equal under the operation comparator, the
+;; mutating operations whatever Arrays.binarySearch returned. Upstream fixed it with
+;; ANode.searchFirstEq (its D1) and tests it through its cljs parity and generative suites,
+;; which the port cannot load; this states the CHANGES entry's claim for the `[id value]`
+;; compared-by-id pattern: disj under cmp-k removes the element lookup reports.
+
+(deftest disj-removes-the-element-lookup-reports
+  (doseq [bf [4 8 32] transient? [false true]]
+    (let [s (reduce #(pset/conj %1 %2 cmp-full)
+                    (pset/sorted-set* {:comparator cmp-full :branching-factor bf})
+                    (for [k (range 40) j (range 3)] [k j]))]
+      (doseq [k (range 40)]
+        (let [probe [k 99]
+              seen (pset/lookup s probe cmp-k)
+              after (if transient?
+                      (persistent! (pset/disj (transient s) probe cmp-k))
+                      (pset/disj s probe cmp-k))]
+          (is (= [k 0] seen) (str "bf=" bf ": lookup takes the leftmost"))
+          (is (not (contains? after seen))
+              (str "bf=" bf " transient=" transient? ": disj removed " seen ", the element lookup reported"))
+          (is (= (dec (count s)) (count after))))))))
