@@ -115,9 +115,14 @@
 
 (def ^:private ^:const expand-len 8)
 
-(defn- new-len ^long [^long len ^Settings s]
+(defn- new-len
+  "The capacity of a node array of len entries: exact for a persistent node; in a transient,
+  room to grow in place, len more (at least expand-len) up to the branching factor. Upstream
+  grows by expand-len (8) alone; doubling copies a growing leaf O(log bf) times instead of
+  O(bf/8) (Seon's EAVT at bf 64: 1,246 -> 845 B an insert)."
+  ^long [^long len ^Settings s]
   (if (settings-editable? s)
-    (min (.-_branchingFactor s) (+ len expand-len))
+    (min (.-_branchingFactor s) (+ len (max expand-len len)))
     len))
 
 (def EARLY_EXIT (object-array 0))
