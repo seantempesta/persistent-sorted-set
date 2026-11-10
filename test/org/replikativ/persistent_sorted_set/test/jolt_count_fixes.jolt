@@ -1,0 +1,73 @@
+;; bin/forks loads a unit file alone, with no fork test directory on a path: the test storage it requires is loaded first.
+(load-file "reference-code/persistent-sorted-set/test/org/replikativ/persistent_sorted_set/test/storage.jolt")
+
+(ns org.replikativ.persistent-sorted-set.test.jolt-count-fixes
+  "The Jolt port's tests for upstream 0.5.145's count-mode fixes whose upstream test lives in a
+  namespace the port cannot load (it needs diff-buf, impl.nodes, from-sorted-seq, compact or
+  markFreed of children). Each deftest names the upstream test or CHANGES.md entry it is
+  taken from; the scenarios and the numbers are upstream's."
+  (:require [clojure.test :refer [deftest testing is]]
+            [org.replikativ.persistent-sorted-set :as pset]
+            [org.replikativ.persistent-sorted-set.test.storage :as ts])
+  (:import [org.replikativ.persistent_sorted_set PersistentSortedSet]))
+
+(def cmp-full
+  (fn [[k1 v1] [k2 v2]]
+    (let [c (compare k1 k2)]
+      (if (zero? c) (compare v1 v2) c))))
+
+(def cmp-k
+  (fn [[k1 _] [k2 _]] (compare k1 k2)))
+
+;; ---- store() never wrote a child that was mutated in place (CHANGES.md 0.5.x) -------------
+;; Upstream's scenario is freed_tracking.clj's run-checkpointed-transient (10,000 [k 0] at bf
+;; 32, stored; one transient stored MID-EDIT each of 20 rounds and mutated further). Upstream
+;; asserts the freed-address accounting there, which the port does not keep for children; this
+;; asserts what the CHANGES entry measured ("in-mem 220 reloaded 219 missing [21]"): the set
+;; restored cold from the last store's address is the one in memory.
+
+(defn- run-checkpointed-transient [mutate!]
+  (let [disk (atom {})
+        settings (pset/default-settings 32)
+        storage (ts/->Storage (atom {}) disk settings)
+        s0 (reduce (fn [s k] (pset/conj s [k 0] cmp-full))
+                   (pset/sorted-set* {:comparator cmp-full :storage storage :branching-factor 32})
+                   (range 10000))
+        _ (pset/store s0 storage)
+        t (transient s0)
+        _ (dotimes [round 20]
+            (mutate! t round)
+            (pset/store t storage))
+        root-addr (pset/store t storage)
+        s-final (persistent! t)
+        reloaded (pset/restore-by cmp-full root-addr (ts/->Storage (atom {}) disk settings)
+                                  {:branching-factor 32})]
+    {:in-memory (vec s-final) :reloaded (vec reloaded)}))
+
+(deftest a-checkpointed-transient-stores-what-it-changed-in-place
+  (testing "conj: [k 1] lands between [k 0] and [k+1 0], an interior insert into a leaf with
+            room, which returns EARLY_EXIT"
+    (let [{:keys [in-memory reloaded]}
+          (run-checkpointed-transient
+           (fn [t round] (dotimes [i 32] (pset/conj t [(+ (* round 32) i) 1] cmp-full))))
+          model (vec (concat (mapcat (fn [k] [[k 0] [k 1]]) (range 640))
+                             (for [k (range 640 10000)] [k 0])))]
+      (is (= model in-memory))
+      (is (= model reloaded) "the reloaded set holds every element conj'd after a store")))
+  (testing "disj"
+    (let [{:keys [in-memory reloaded]}
+          (run-checkpointed-transient
+           (fn [t round] (dotimes [i 32] (pset/disj t [(+ (* round 32) i) 0] cmp-full))))
+          model (vec (for [k (range 640 10000)] [k 0]))]
+      (is (= model in-memory))
+      (is (= model reloaded) "the reloaded set holds no element disj'd after a store")))
+  (testing "replace"
+    (let [{:keys [in-memory reloaded]}
+          (run-checkpointed-transient
+           (fn [t round]
+             (dotimes [i 32]
+               (let [k (+ (* round 32) i)]
+                 (pset/replace t [k 0] [k (inc round)] cmp-k)))))
+          model (vec (for [k (range 10000)] (if (< k 640) [k (inc (quot k 32))] [k 0])))]
+      (is (= model in-memory))
+      (is (= model reloaded) "the reloaded set holds every replacement made after a store"))))
