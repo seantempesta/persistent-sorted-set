@@ -109,3 +109,32 @@
         (str "from-sequential, " n " elements"))
     (is (nil? (meta (pset/from-sorted-array compare (to-array (range n)) n {})))
         (str "no :meta is nil, as sorted-set*, " n " elements"))))
+
+;; ---- nil cannot get in through any entry point ----------------------------------------------
+;; CHANGES.md 0.5.x "Two entry points allowed nil into a set": replace's new key and
+;; from-sorted-array (a nil element, or a len past the array). These three deftests are
+;; upstream's, from cljs_api_parity.cljc (a namespace the port cannot load whole: it tests
+;; compact), with arr-of as (to-array xs); test/.../contract.jolt and empty_bulk_build.jolt
+;; hold the other entry points.
+
+(deftest replace-refuses-a-nil-new-key
+  (let [s (pset/from-sorted-array compare (to-array [1 2 3]) 3)]
+    (is (thrown? IllegalArgumentException (pset/replace s 2 nil))
+        "a nil replacement must be refused")
+    (is (= [1 2 3] (vec s)) "and the set is untouched")))
+
+(deftest an-out-of-range-len-is-refused
+  (doseq [[label arr len] [["empty array, len 1" [] 1]
+                           ["len past the end"   [1 2 3] 5]
+                           ["negative len"       [1 2 3] -1]]]
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (pset/from-sorted-array compare (to-array arr) len))
+        (str label ": must be refused, not silently accepted"))))
+
+(deftest a-nil-element-is-refused-by-from-sorted-array
+  (is (thrown? IllegalArgumentException
+               (pset/from-sorted-array compare (to-array [1 nil 3]) 3))
+      "a nil element anywhere")
+  (is (thrown? IllegalArgumentException
+               (pset/from-sorted-array compare (to-array [nil 1]) 2))
+      "including a LEADING nil, which under `compare` is legitimately ascending"))

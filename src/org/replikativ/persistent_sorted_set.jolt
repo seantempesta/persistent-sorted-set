@@ -874,7 +874,7 @@
   (comparator [_] _cmp)
   (hasSubtreeCounts [this] (>= (subtree-count (.root this)) 0))
   (cons [this key cmp]
-    (when (nil? key) (throw (ex-info "PersistentSortedSet cannot store nil" {})))
+    (when (nil? key) (throw (IllegalArgumentException. "PersistentSortedSet cannot store nil")))
     (ensure-live-transient _settings)
     (let [nodes (node-add (.root this) _storage key cmp _settings)]
       (if (identical? nodes UNCHANGED)
@@ -915,6 +915,8 @@
                   (PersistentSortedSet. _meta _cmp nil _storage nr (if (>= rc 0) rc -1) _settings (inc _version))))))))))
   (replace [this old new] (.replace this old new _cmp))
   (replace [this old new cmp]
+    ;; replace was the other way nil got in (upstream 0.5.145): (replace s 1 nil) held [nil]
+    (when (nil? new) (throw (IllegalArgumentException. "PersistentSortedSet cannot store nil")))
     (ensure-live-transient _settings)
     (let [nodes (node-replace (.root this) _storage old new cmp _settings)]
       (cond
@@ -1129,11 +1131,18 @@
   ([cmp keys] (from-sorted-array cmp keys (arrays/alength keys) {}))
   ([cmp keys len] (from-sorted-array cmp keys len {}))
   ([cmp keys len opts]
-   (let [settings (map->settings opts)
+   (let [arr (if (arrays/array? keys) keys (to-array keys))
+         ;; len names a real prefix of keys, and no key is nil (upstream 0.5.145): a len past
+         ;; the array, or a nil key, made a set holding nil, durable once stored
+         _ (when (or (neg? len) (> len (alength arr)))
+             (throw (ex-info "from-sorted-array: len out of range" {:len len :array-length (alength arr)})))
+         _ (dotimes [i len]
+             (when (nil? (aget arr i))
+               (throw (IllegalArgumentException. (str "PersistentSortedSet cannot store nil (index " i ")")))))
+         settings (map->settings opts)
          mx (.-_branchingFactor settings)
          avg (quot (+ (unsigned-bit-shift-right mx 1) mx) 2)
-         storage (:storage opts)
-         arr (if (arrays/array? keys) keys (to-array keys))]
+         storage (:storage opts)]
      (loop [level 1
             nodes (mapv (fn [^objects ks] (Leaf. (alength ks) ks settings))
                         (split-arrays arr len avg mx))]
@@ -1153,7 +1162,7 @@
 (defn from-sequential
   ([cmp keys] (from-sequential cmp keys {}))
   ([cmp keys opts]
-   (when (some nil? keys) (throw (ex-info "PersistentSortedSet cannot store nil" {})))
+   (when (some nil? keys) (throw (IllegalArgumentException. "PersistentSortedSet cannot store nil")))
    (let [sorted (vec (dedupe-by-cmp cmp (sort cmp keys)))]
      (from-sorted-array cmp (to-array sorted) (count sorted) opts))))
 
