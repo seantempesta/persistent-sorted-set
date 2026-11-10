@@ -138,3 +138,53 @@
   (is (thrown? IllegalArgumentException
                (pset/from-sorted-array compare (to-array [nil 1]) 2))
       "including a LEADING nil, which under `compare` is legitimately ascending"))
+
+;; ---- counts stay known through a join -------------------------------------------------------
+;; CHANGES.md 0.5.x "Counts: a cold reader no longer pays to recover them": a remove that joins a
+;; branch with a sibling recomputed the joined count from its children, which is -1 (unknown)
+;; whenever one is not in memory, as after a cold restore, where only the path and its two
+;; siblings are; upstream measured, bf 16, one disj on a cold 10000-element tree: spine counts
+;; -1/-1/-1 under a root that knew 9999. Upstream's tests (durable_count_read_side.clj,
+;; subtree_count_persistence.clj) need impl.nodes; this is their claim on the port: after
+;; disjs from a cold tree whose nodes carry their counts, the root knows its count and counting
+;; the set restores nothing. (A branch that redistributed entries with a sibling still sums its
+;; children, unknown when one is cold, in upstream as here, so not every branch in memory knows.)
+
+(defrecord CountStorage [*memory *disk *reads settings]
+  org.replikativ.persistent_sorted_set.IStorage
+  (store [_ node]
+    (let [address (random-uuid)]
+      (swap! *disk assoc address
+             (pr-str {:level (.level node) :keys (.keys node)
+                      :addresses (when (instance? org.replikativ.persistent_sorted_set.Branch node) (.addresses node))
+                      :subtree-count (.subtreeCount node)}))
+      address))
+  (accessed [_ _] nil)
+  (restore [_ address]
+    (or (@*memory address)
+        (let [{:keys [level keys addresses subtree-count]} (clojure.edn/read-string (@*disk address))
+              node (pset/restore-node level keys addresses subtree-count settings)]
+          (swap! *reads inc)
+          (swap! *memory assoc address node)
+          node)))
+  (markFreed [_ _] nil)
+  (isFreed [_ _] false)
+  (freedInfo [_ _] nil))
+
+(deftest a-join-keeps-the-counts-it-already-knows
+  (doseq [bf [8 16]]
+    (let [n 10000
+          disk (atom {})
+          settings (pset/default-settings bf)
+          built (reduce #(pset/conj %1 %2 compare) (pset/sorted-set* {:branching-factor bf}) (range n))
+          addr (pset/store built (->CountStorage (atom {}) disk (atom 0) settings))]
+      (doseq [ks [[0] [1 2 3] (range 0 n 997)]]
+        (let [reads (atom 0)
+              st (->CountStorage (atom {}) disk reads settings)
+              cold (pset/restore-by compare addr st {:branching-factor bf})
+              after (reduce #(pset/disj %1 %2 compare) cold ks)
+              root (.root after)]
+          (is (not (neg? (.subtreeCount root))) (str "bf=" bf " disj " (count ks) ": the root knows its count"))
+          (reset! reads 0)
+          (is (= (- n (count ks)) (count after)))
+          (is (zero? @reads) (str "bf=" bf " disj " (count ks) ": counting restored nothing")))))))

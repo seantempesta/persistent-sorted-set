@@ -556,10 +556,20 @@
                     (when cs (stitch cs end len cc pos)))))
             (let [r (rebalance b left right [ck ca cc clen] settings)
                   c (aget r 1)]
-              ;; the rebuilt center's count: the old count minus one when it was known
-              (when (and (branch? c) (identical? (aget r 0) left) (identical? (aget r 2) right)
-                         (>= cnt 0))
-                (set! (.-_subtreeCount ^Branch c) (dec cnt)))
+              ;; the rebuilt center's count by delta (upstream 0.5.145, Branch.remove): this node
+              ;; less the one removed element, plus a sibling it joined, whose count is carried
+              ;; whole. build-node sums children, which is unknown (-1) when one is not in memory,
+              ;; as after a cold restore; a redistribution with a sibling keeps that sum.
+              (when (and (branch? c) (>= cnt 0))
+                (cond
+                  (and (identical? (aget r 0) left) (identical? (aget r 2) right))
+                  (set! (.-_subtreeCount ^Branch c) (dec cnt))
+
+                  (and left (nil? (aget r 0)) (>= (subtree-count left) 0))
+                  (set! (.-_subtreeCount ^Branch c) (+ (subtree-count left) (dec cnt)))
+
+                  (and right (nil? (aget r 2)) (>= (subtree-count right) 0))
+                  (set! (.-_subtreeCount ^Branch c) (+ (dec cnt) (subtree-count right)))))
               r)))))))
 
 (defn- node-remove [n storage key left right cmp settings]
