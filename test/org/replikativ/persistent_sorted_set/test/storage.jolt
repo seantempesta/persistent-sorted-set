@@ -1,0 +1,55 @@
+(ns org.replikativ.persistent-sorted-set.test.storage
+  "Upstream 0.5.145's test storage (test-clojure/.../test/storage.clj), the helpers only, on the
+  Jolt port: a store keeps a node's EDN form in *disk and restores it through `restore-node`
+  (upstream builds Branch/Leaf through their Java constructors and reconstructs diff-buf slots,
+  which the port does not have). Loaded by the unit files that require it, as bin/forks puts no
+  fork test directory on a path."
+  (:require [clojure.edn :as edn]
+            [org.replikativ.persistent-sorted-set :as set])
+  (:import [org.replikativ.persistent_sorted_set IStorage Branch]))
+
+(defn gen-addr [] (random-uuid))
+
+(def *stats (atom {:reads 0 :writes 0 :accessed 0}))
+
+(defmacro with-stats [& body]
+  `(do (reset! *stats {:reads 0 :writes 0 :accessed 0}) ~@body))
+
+(defrecord Storage [*memory *disk settings]
+  IStorage
+  (store [_ node]
+    (swap! *stats update :writes inc)
+    (let [address (gen-addr)]
+      (swap! *disk assoc address
+             (pr-str {:level (.level node)
+                      :keys (.keys node)
+                      :addresses (when (instance? Branch node) (.addresses node))}))
+      address))
+  (accessed [_ address]
+    (swap! *stats update :accessed inc)
+    nil)
+  (restore [_ address]
+    (or (@*memory address)
+        (let [{:keys [level keys addresses]} (edn/read-string (@*disk address))
+              node (set/restore-node level keys addresses settings)]
+          (swap! *stats update :reads inc)
+          (swap! *memory assoc address node)
+          node)))
+  (markFreed [_ address] nil)
+  (isFreed [_ address] false)
+  (freedInfo [_ address] nil))
+
+(defn storage
+  ([] (->Storage (atom {}) (atom {}) (set/default-settings 0)))
+  ([*disk] (->Storage (atom {}) *disk (set/default-settings 0)))
+  ([*memory *disk] (->Storage *memory *disk (set/default-settings 0))))
+
+(defn storage-with-settings
+  "Create storage that uses the given Settings for node creation"
+  [settings]
+  (->Storage (atom {}) (atom {}) settings))
+
+(defn roundtrip [set]
+  (let [storage (storage)
+        address (set/store set storage)]
+    (set/restore address storage)))
