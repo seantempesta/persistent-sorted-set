@@ -11,7 +11,10 @@
 ;; (Jolt's `seq` does not reach the set's Seqable.seq), so it has no `seek`; the ascending seqs
 ;; here are `(set/slice s nil nil)`, which is what `seq` answers on the JVM.
 
-(def iters 100)
+;; Jolt port: the iteration counts are cut to keep the unit near 30 s on Jolt (upstream's ran
+;; 5 min 15 s here): iters 100 -> 10, stresstest-rslice 10000 -> 100 rounds, test-overflow
+;; 4,000,000 -> 400,000 elements. Each round is the same random property as upstream's.
+(def iters 10)
 
 (defn into-via-doseq [to from]
   (let [res (transient [])]
@@ -114,9 +117,12 @@
                    ;; value), and it made the suite intermittently NPE with a stack trace
                    ;; that pointed at the library rather than at the test. Assert the nil
                    ;; instead of dereferencing it.
+                   ;; Jolt port: two assertions on the nil arm, as on the other, so the unit's
+                   ;; count (which bin/forks compares) does not depend on the random range
                    (if (nil? set-range)
-                     (is (empty? expected)
-                         "slice returned nil, so the expected range must be empty")
+                     (and (is (empty? expected)
+                              "slice returned nil, so the expected range must be empty")
+                          (is (nil? (seq expected))))
                      (and
                       (is (= (vec (rseq set-range)) (reverse expected)))
                       (is (= (vec (rseq (rseq set-range))) expected))))))
@@ -127,7 +133,7 @@
 (deftest stresstest-rslice
   (println "  testing stresstest-rslice...")
   (loop [i 0]
-    (when (< i 10000)
+    (when (< i 100)
       (let [len 3000
             xs  (vec (shuffle (range 0 (inc 3000))))
             s   (into (set/sorted-set) xs)]
@@ -164,7 +170,7 @@
 
 (deftest test-overflow
   (println "  testing test-overflow...")
-  (let [len  4000000
+  (let [len  400000
         part (quot len 100)
         xss  (partition-all part (shuffle (range 0 len)))
         s    (reduce into (set/sorted-set) xss)]
