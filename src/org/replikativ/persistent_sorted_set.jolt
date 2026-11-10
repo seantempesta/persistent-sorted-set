@@ -1167,8 +1167,11 @@
    (PersistentSortedSet. nil cmp address storage nil -1 (map->settings opts) 0)))
 
 (defn restore
+  "A set read lazily from storage at address, under (:comparator opts) or (:cmp opts), else
+  compare (upstream 0.5.145: restore ignored :comparator, so a set stored under another
+  comparator came back navigated by compare)."
   ([address storage] (restore-by compare address storage {}))
-  ([address storage opts] (restore-by compare address storage opts)))
+  ([address storage opts] (restore-by (or (:comparator opts) (:cmp opts) compare) address storage opts)))
 
 (defn walk-addresses [^PersistentSortedSet set consume-fn] (.walkAddresses set consume-fn))
 
