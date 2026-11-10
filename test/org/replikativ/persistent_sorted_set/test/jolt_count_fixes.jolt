@@ -94,3 +94,18 @@
           (is (not (contains? after seen))
               (str "bf=" bf " transient=" transient? ": disj removed " seen ", the element lookup reported"))
           (is (= (dec (count s)) (count after))))))))
+
+;; ---- the bulk builders honour :meta ---------------------------------------------------------
+;; CHANGES.md 0.5.x "`from-sorted-seq` honours `:meta` on the JVM": it built with a hard-coded
+;; {} while sorted-set* passed (:meta opts) through; from-sorted-array's 0- and 1-node arms did
+;; the same in 0.4.137 (the port: nil). Upstream's test is in bulk_build.clj, on from-sorted-seq,
+;; which the port does not have; this states it for from-sorted-array and from-sequential.
+
+(deftest the-bulk-builders-keep-meta
+  (doseq [n [0 5 2000]]
+    (is (= {:x 1} (meta (pset/from-sorted-array compare (to-array (range n)) n {:meta {:x 1}})))
+        (str "from-sorted-array, " n " elements"))
+    (is (= {:x 1} (meta (pset/from-sequential compare (range n) {:meta {:x 1}})))
+        (str "from-sequential, " n " elements"))
+    (is (nil? (meta (pset/from-sorted-array compare (to-array (range n)) n {})))
+        (str "no :meta is nil, as sorted-set*, " n " elements"))))

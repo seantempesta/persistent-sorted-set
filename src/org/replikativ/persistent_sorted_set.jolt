@@ -1138,8 +1138,9 @@
             nodes (mapv (fn [^objects ks] (Leaf. (alength ks) ks settings))
                         (split-arrays arr len avg mx))]
        (case (count nodes)
-         0 (PersistentSortedSet. nil cmp nil storage (Leaf. 0 (object-array 0) settings) 0 settings 0)
-         1 (PersistentSortedSet. nil cmp nil storage (first nodes) len settings 0)
+         ;; (:meta opts), as sorted-set* (upstream 0.5.145: the bulk builders dropped it)
+         0 (PersistentSortedSet. (:meta opts) cmp nil storage (Leaf. 0 (object-array 0) settings) 0 settings 0)
+         1 (PersistentSortedSet. (:meta opts) cmp nil storage (first nodes) len settings 0)
          (recur (inc level)
                 (mapv (fn [^objects children]
                         (let [n (alength children)
