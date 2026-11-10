@@ -93,10 +93,25 @@
     (when (and (some? e) (not @e))
       (throw (IllegalAccessError. "Transient used after persistent! call")))))
 
+(def ^:private ^:const min-branching-factor 4)
+
+(defn- check-branching-factor
+  "bf, or 512 when unset (nil, zero or negative). 1, 2 and 3 are refused (upstream 0.5.145's
+  Settings.checkBranchingFactor): their minimum fill (bf >>> 1) is 1, so a branch of one child
+  counts as full, that child has no sibling to rebalance with, a removal leaves an empty leaf,
+  and a bulk build at bf 1 or 2 never reduces its level count."
+  ^long [bf]
+  (cond (or (nil? bf) (not (pos? bf))) 512
+        (< bf min-branching-factor)
+        (throw (IllegalArgumentException.
+                (str "branching-factor " bf " is not supported: the minimum is " min-branching-factor
+                     ". Pass 0 (or omit it) for the default of 512.")))
+        :else bf))
+
 (defn- make-settings
   ([] (make-settings 512))
   ([bf] (make-settings bf nil))
-  ([bf ref-type] (Settings. (if (and bf (pos? bf)) (int bf) 512) nil 0 (when (#{:weak :soft} ref-type) :weak))))
+  ([bf ref-type] (Settings. (int (check-branching-factor bf)) nil 0 (when (#{:weak :soft} ref-type) :weak))))
 
 (def ^:private ^:const expand-len 8)
 
