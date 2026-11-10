@@ -84,6 +84,15 @@
 (defn- settings-editable? [^Settings s]
   (let [e (.-_edit s)] (and (some? e) @e)))
 
+(defn- ensure-live-transient
+  "Refuses a stale transient handle, one persistent! has sealed (upstream 0.5.145's
+  ensureLiveTransient, Clojure's ensureEditable): its settings hold an edit flag that is false.
+  A set never made transient holds none."
+  [^Settings s]
+  (let [e (.-_edit s)]
+    (when (and (some? e) (not @e))
+      (throw (IllegalAccessError. "Transient used after persistent! call")))))
+
 (defn- make-settings
   ([] (make-settings 512))
   ([bf] (make-settings bf nil))
@@ -851,6 +860,7 @@
   (hasSubtreeCounts [this] (>= (subtree-count (.root this)) 0))
   (cons [this key cmp]
     (when (nil? key) (throw (ex-info "PersistentSortedSet cannot store nil" {})))
+    (ensure-live-transient _settings)
     (let [nodes (node-add (.root this) _storage key cmp _settings)]
       (if (identical? nodes UNCHANGED)
         this
@@ -867,6 +877,7 @@
                   rc (subtree-count new-root)]
               (PersistentSortedSet. _meta _cmp nil _storage new-root (if (>= rc 0) rc -1) _settings (inc _version))))))))
   (disjoin [this key cmp]
+    (ensure-live-transient _settings)
     (let [nodes (node-remove (.root this) _storage key nil nil cmp _settings)]
       (cond
         (identical? nodes UNCHANGED) this
@@ -889,6 +900,7 @@
                   (PersistentSortedSet. _meta _cmp nil _storage nr (if (>= rc 0) rc -1) _settings (inc _version))))))))))
   (replace [this old new] (.replace this old new _cmp))
   (replace [this old new cmp]
+    (ensure-live-transient _settings)
     (let [nodes (node-replace (.root this) _storage old new cmp _settings)]
       (cond
         (identical? nodes UNCHANGED) this
@@ -1002,8 +1014,12 @@
   (conj [this key] (.cons this key _cmp))
   (persistent [this]
     (when-not (settings-editable? _settings) (throw (ex-info "Expected transient set" {})))
+    ;; a NEW set, as every Clojure transient's persistent! returns: this handle keeps the
+    ;; sealed edit flag, so a later conj!/disj! on it throws (ensure-live-transient)
     (vreset! (.-_edit ^Settings _settings) false)
-    this)
+    (PersistentSortedSet. _meta _cmp _address _storage _root _count
+                          (Settings. (.-_branchingFactor ^Settings _settings) nil 0 (.-_refType ^Settings _settings))
+                          _version))
   clojure.lang.IReduceInit
   (reduce [this f init] (if-let [s (.slice this nil nil _cmp)] (seq-reduce s f init) init))
   clojure.lang.IHashEq
