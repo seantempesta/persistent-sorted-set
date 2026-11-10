@@ -587,6 +587,12 @@
 
 (declare ->seq-slice ->seq-rslice seq-advance seq-reduce at-beginning? at-end?)
 
+(defn- seek-outside?
+  "Is `to` outside node's key range, on either side (a seek climbs past such a node)?"
+  [node to cmp]
+  (or (neg? (long (cmp (node-max-key node) to)))
+      (neg? (long (cmp to (aget (node-keys node) 0))))))
+
 (deftype Seq [_meta _set _parent _node ^long _idx _keyTo _cmp _asc ^long _version _leafSafe]
   clojure.lang.ISeq
   (first [_] (aget (node-keys _node) _idx))
@@ -619,13 +625,16 @@
   (seek [this to] (.seek this to _cmp))
   (seek [this to cmp]
     (when (nil? to) (throw (ex-info "seek can't be called with a nil key!" {})))
+    ;; climb while `to` is outside this node's subtree on EITHER side (upstream Seq.seek, 0.5.145):
+    ;; testing only the direction of travel left a backward seek inside the current leaf
     (if _asc
       (loop [seq _parent node _node]
-        (if (and node (neg? (long (cmp (node-max-key node) to))))
-          (if (nil? seq) nil (recur (.-_parent ^Seq seq) (.-_node ^Seq seq)))
-          (->seq-slice _set seq node to _keyTo cmp _version)))
+        (if (and seq (seek-outside? node to cmp))
+          (recur (.-_parent ^Seq seq) (.-_node ^Seq seq))
+          (when-not (neg? (long (cmp (node-max-key node) to)))
+            (->seq-slice _set seq node to _keyTo cmp _version))))
       (loop [seq _parent node _node]
-        (if (and (neg? (long (cmp to (aget (node-keys node) 0)))) seq)
+        (if (and seq (seek-outside? node to cmp))
           (recur (.-_parent ^Seq seq) (.-_node ^Seq seq))
           (->seq-rslice _set seq node to _keyTo cmp _version)))))
   Object
