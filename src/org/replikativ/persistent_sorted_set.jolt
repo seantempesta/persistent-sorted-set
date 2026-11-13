@@ -642,7 +642,8 @@
   (seq [this] this)
   clojure.lang.Sequential
   clojure.lang.IPersistentCollection
-  (count [this] (loop [s (seq-advance this) n 1] (if s (recur (seq-advance s) (inc n)) n)))
+  ;; folded over the leaf arrays (seq-reduce): stepping built a Seq per element, 464 B each
+  (count [this] (seq-reduce this (fn [n _] (inc n)) 0))
   (empty [_] ())
   (equiv [this o] (= (seq (vec this)) (seq o)))
   clojure.lang.IMeta
