@@ -843,7 +843,7 @@
                                    idx)]
                          (when (< idx (node-len _leaf))
                            (set! _leafIdx idx)
-                           (aget (node-keys _leaf) idx))))]
+                           (read-key storage (node-keys _leaf) idx))))]
         (or leaf-hit
             (loop [level (dec _depth)]
               (if (< level 0)
@@ -864,7 +864,7 @@
                                         (set! _leaf node)
                                         (let [idx (search-first (node-keys node) (node-len node) key cmp)]
                                           (if (< idx (node-len node))
-                                            (do (set! _leafIdx idx) (aget (node-keys node) idx))
+                                            (do (set! _leafIdx idx) (read-key storage (node-keys node) idx))
                                             (recur (inc bi))))))
                                   (recur (inc bi)))))]
                   (or found (recur (dec level))))))))))
@@ -872,7 +872,7 @@
     (when _leaf
       (set! _leafIdx (inc _leafIdx))
       (if (< _leafIdx (node-len _leaf))
-        (aget (node-keys _leaf) _leafIdx)
+        (read-key (.-_storage ^PersistentSortedSet _set) (node-keys _leaf) _leafIdx)
         (let [storage (.-_storage ^PersistentSortedSet _set)]
           (loop [level (dec _depth)]
             (if (< level 0)
@@ -886,11 +886,11 @@
                                          (recur (inc d) (node-child node storage 0)))
                                      node))]
                         (set! _leaf node) (set! _leafIdx 0)
-                        (aget (node-keys node) 0)))
+                        (read-key storage (node-keys node) 0)))
                   (recur (dec level))))))))))
   (current [_]
     (when (and _leaf (>= _leafIdx 0) (< _leafIdx (node-len _leaf)))
-      (aget (node-keys _leaf) _leafIdx))))
+      (read-key (.-_storage ^PersistentSortedSet _set) (node-keys _leaf) _leafIdx))))
 
 ;; ---------------------------------------------------------------------------
 ;; The set
@@ -984,7 +984,7 @@
             (when (< idx len)
               (if (branch? node)
                 (recur (node-child node _storage idx))
-                (aget (node-keys node) idx))))))))
+                (read-key _storage (node-keys node) idx))))))))
   (slice [this from to] (.slice this from to _cmp))
   (slice [this from to cmp]
     (let [root (.root this)]
