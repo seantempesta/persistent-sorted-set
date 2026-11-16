@@ -27,6 +27,23 @@
 
 (definterface ISubtreeCount (subtreeCount []))
 
+;; A storage that keeps part of a key unread in its leaves (Datahike's large values, held as a
+;; reference until read) implements IReadKey: the key as a reader receives it. Applied where a key
+;; leaves the set (a seq's first and reduce, lookup) and written back into its leaf, so each key is
+;; read once; comparisons inside the set see the stored key.
+(definterface IReadKey (readKey [key]))
+
+(defn- read-key
+  "keys[idx] of node as storage's reader receives it (IReadKey), set back into the array when it
+  differs (idempotent: any reader writes the same key)."
+  [storage ^objects keys ^long idx]
+  (let [k (aget keys idx)]
+    (if (instance? IReadKey storage)
+      (let [k' (.readKey ^IReadKey storage k)]
+        (when-not (identical? k k') (aset keys idx k'))
+        k')
+      k)))
+
 (definterface ISeek (seek [to]) (seek [to cmp]))
 
 (definterface INode
@@ -634,7 +651,7 @@
 
 (deftype Seq [_meta _set _parent _node ^long _idx _keyTo _cmp _asc ^long _version _leafSafe]
   clojure.lang.ISeq
-  (first [_] (aget (node-keys _node) _idx))
+  (first [_] (read-key (.-_storage ^PersistentSortedSet _set) (node-keys _node) _idx))
   (next [this] (seq-advance this))
   (more [this] (or (seq-advance this) ()))
   (cons [this o] (clojure.lang.Cons. o this))
@@ -655,7 +672,8 @@
   clojure.lang.IReduce
   (reduce [this f]
     (let [n (seq-advance this)]
-      (if n (seq-reduce n f (aget (node-keys _node) _idx)) (aget (node-keys _node) _idx))))
+      (let [k (read-key (.-_storage ^PersistentSortedSet _set) (node-keys _node) _idx)]
+        (if n (seq-reduce n f k) k))))
   clojure.lang.Reversible
   (rseq [this]
     (if _asc
@@ -732,7 +750,7 @@
     (if (nil? s)
       acc
       (let [node (.-_node s) keys (node-keys node) len (node-len node)
-            kt (.-_keyTo s) cmp (.-_cmp s) safe (.-_leafSafe s)]
+            kt (.-_keyTo s) cmp (.-_cmp s) safe (.-_leafSafe s) st (seq-storage s)]
         (if (.-_asc s)
           (let [[acc stop?]
                 (loop [i (.-_idx s) acc acc]
@@ -740,7 +758,7 @@
                     (let [k (aget keys i)]
                       (if (and (not safe) kt (pos? (long (cmp k kt))))
                         [acc true]
-                        (let [acc (f acc k)]
+                        (let [acc (f acc (read-key st keys i))]
                           (if (reduced? acc) [acc true] (recur (inc i) acc)))))
                     [acc false]))]
             (if stop?
@@ -756,7 +774,7 @@
                     (let [k (aget keys i)]
                       (if (and (not safe) kt (neg? (long (cmp k kt))))
                         [acc true]
-                        (let [acc (f acc k)]
+                        (let [acc (f acc (read-key st keys i))]
                           (if (reduced? acc) [acc true] (recur (dec i) acc)))))
                     [acc false]))]
             (if stop?
@@ -955,8 +973,8 @@
             (when (< idx len)
               (if (branch? node)
                 (recur (node-child node _storage idx))
-                (let [k (aget (node-keys node) idx)]
-                  (when (zero? (long (cmp k key))) k)))))))))
+                (when (zero? (long (cmp (aget (node-keys node) idx) key)))
+                  (read-key _storage (node-keys node) idx)))))))))
   (lookupGE [this key] (.lookupGE this key _cmp))
   (lookupGE [this key cmp]
     (loop [node (.root this)]
