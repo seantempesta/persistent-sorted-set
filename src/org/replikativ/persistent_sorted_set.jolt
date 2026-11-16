@@ -641,7 +641,7 @@
 ;; ---------------------------------------------------------------------------
 ;; Seq: a cursor stack (parent = the Seq one level up, positioned at this node).
 
-(declare ->seq-slice ->seq-rslice seq-advance seq-reduce at-beginning? at-end?)
+(declare ->seq-slice ->seq-rslice seq-advance seq-reduce at-beginning? at-end? set-storage)
 
 (defn- seek-outside?
   "Is `to` outside node's key range, on either side (a seek climbs past such a node)?"
@@ -651,7 +651,7 @@
 
 (deftype Seq [_meta _set _parent _node ^long _idx _keyTo _cmp _asc ^long _version _leafSafe]
   clojure.lang.ISeq
-  (first [_] (read-key (.-_storage ^PersistentSortedSet _set) (node-keys _node) _idx))
+  (first [_] (read-key (set-storage _set) (node-keys _node) _idx))
   (next [this] (seq-advance this))
   (more [this] (or (seq-advance this) ()))
   (cons [this o] (clojure.lang.Cons. o this))
@@ -672,7 +672,7 @@
   clojure.lang.IReduce
   (reduce [this f]
     (let [n (seq-advance this)]
-      (let [k (read-key (.-_storage ^PersistentSortedSet _set) (node-keys _node) _idx)]
+      (let [k (read-key (set-storage _set) (node-keys _node) _idx)]
         (if n (seq-reduce n f k) k))))
   clojure.lang.Reversible
   (rseq [this]
@@ -750,7 +750,7 @@
     (if (nil? s)
       acc
       (let [node (.-_node s) keys (node-keys node) len (node-len node)
-            kt (.-_keyTo s) cmp (.-_cmp s) safe (.-_leafSafe s) st (seq-storage s)]
+            kt (.-_keyTo s) cmp (.-_cmp s) safe (.-_leafSafe s) st (set-storage (.-_set s))]
         (if (.-_asc s)
           (let [[acc stop?]
                 (loop [i (.-_idx s) acc acc]
@@ -872,7 +872,7 @@
     (when _leaf
       (set! _leafIdx (inc _leafIdx))
       (if (< _leafIdx (node-len _leaf))
-        (read-key (.-_storage ^PersistentSortedSet _set) (node-keys _leaf) _leafIdx)
+        (read-key (set-storage _set) (node-keys _leaf) _leafIdx)
         (let [storage (.-_storage ^PersistentSortedSet _set)]
           (loop [level (dec _depth)]
             (if (< level 0)
@@ -890,7 +890,7 @@
                   (recur (dec level))))))))))
   (current [_]
     (when (and _leaf (>= _leafIdx 0) (< _leafIdx (node-len _leaf)))
-      (read-key (.-_storage ^PersistentSortedSet _set) (node-keys _leaf) _leafIdx))))
+      (read-key (set-storage _set) (node-keys _leaf) _leafIdx))))
 
 ;; ---------------------------------------------------------------------------
 ;; The set
@@ -1079,6 +1079,12 @@
   (hashCode [this] (reduce (fn [h k] (+ h (hash k))) 0 this))
   (equals [this o] (.equiv this o))
   (toString [this] (str "#{" (clojure.string/join " " (map str this)) "}")))
+
+
+(defn- set-storage
+  "The storage of sorted set s: defined after its type, so the field read resolves (a Seq or cursor, defined before
+  the set, reading it through a hint unresolved there, read it reflectively, ~90 B a seek)."
+  [^PersistentSortedSet s] (.-_storage s))
 
 (defn- grow-root [nodes settings]
   (let [n (alength nodes)
