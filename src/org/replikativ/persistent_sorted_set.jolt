@@ -29,20 +29,17 @@
 
 ;; A storage that keeps part of a key unread in its leaves (Datahike's large values, held as a
 ;; reference until read) implements IReadKey: the key as a reader receives it. Applied where a key
-;; leaves the set (a seq's first and reduce, lookup) and written back into its leaf, so each key is
-;; read once; comparisons inside the set see the stored key.
+;; leaves the set (a seq's first and reduce, lookup), and never written back into its leaf: a leaf
+;; weighs after a read what it weighed when a cache booked it, and a leaf a forked process inherited
+;; is never written by a read (the storage keeps what it read, under its own weighed entry);
+;; comparisons inside the set see the stored key.
 (definterface IReadKey (readKey [key]))
 
 (defn- read-key
-  "keys[idx] of node as storage's reader receives it (IReadKey), set back into the array when it
-  differs (idempotent: any reader writes the same key)."
+  "keys[idx] of node as storage's reader receives it (IReadKey); the array is left as stored."
   [storage ^objects keys ^long idx]
   (let [k (aget keys idx)]
-    (if (instance? IReadKey storage)
-      (let [k' (.readKey ^IReadKey storage k)]
-        (when-not (identical? k k') (aset keys idx k'))
-        k')
-      k)))
+    (if (instance? IReadKey storage) (.readKey ^IReadKey storage k) k)))
 
 (definterface ISeek (seek [to]) (seek [to cmp]))
 
