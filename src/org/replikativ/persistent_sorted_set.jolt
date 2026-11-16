@@ -243,6 +243,10 @@
         (when (nil? (aget addrs i))
           (aset addrs i (.store ^INode (aget _children i) storage))))
       (set! _addresses addrs)
+      ;; under :weak every child now has an address, so the storage (its node cache) is its one holder, as node-child keeps
+      ;; none it restores: a child kept here pinned every node ever stored (upstream wraps it in a Weak/SoftReference instead,
+      ;; Branch.java wrapAddressedChildren)
+      (when (= :weak (.-_refType ^Settings _settings)) (set! _children nil))
       (.store ^IStorage storage this)))
   IBranch
   (address [_ i] (when _addresses (aget _addresses i)))

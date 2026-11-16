@@ -1,0 +1,38 @@
+;; bin/forks loads a unit file alone, with no fork test directory on a path: the test storage it requires is loaded first.
+(load-file "reference-code/persistent-sorted-set/test/org/replikativ/persistent_sorted_set/test/storage.jolt")
+
+(ns org.replikativ.persistent-sorted-set.test.storage.stored-children
+  (:require
+   [clojure.test :refer [is deftest testing]]
+   [org.replikativ.persistent-sorted-set :as set]
+   [org.replikativ.persistent-sorted-set.test.storage :refer [*stats storage]])
+  (:import
+   (org.replikativ.persistent_sorted_set Branch PersistentSortedSet)))
+
+;; Under :weak a branch holds no child it does not need: the storage (its node cache) is the one holder of a node that has
+;; an address, as node-child already does for a child it restores. A store gives every child an address, so after it the
+;; branches keep none (upstream wraps each stored child in a Weak/SoftReference, Branch.java wrapAddressedChildren: a bare
+;; strong child under an address pins its whole subtree). Datahike's writer stores every commit, so a kept child pinned
+;; every node written since boot (data's heap accounting, ~146 MB on a seeded main, 2026-11-16).
+
+(defn- held-children
+  "The children the tree's branches hold in memory, counted over every branch reachable through held children."
+  [node]
+  (if (instance? Branch node)
+    (let [cs (filter some? (or (some-> (.-_children ^Branch node) seq) []))]
+      (+ (count cs) (reduce + 0 (map held-children cs))))
+    0))
+
+(deftest a-stored-child-is-held-by-the-storage-alone
+  (testing ":weak: after a store no branch holds a child, and every key reads back through the storage"
+    (let [s (into (set/sorted-set* {:branching-factor 32 :ref-type :weak}) (range 0 5000))
+          st (storage)
+          _ (set/store s st)
+          r (.-_root ^PersistentSortedSet s)]
+      (is (instance? Branch r) "5000 keys at branching 32 make a branch root")
+      (is (= 0 (held-children r)))
+      (is (= (range 0 5000) (seq s)) "every key reads back, restored through the storage")))
+  (testing ":strong is unchanged: a stored branch keeps its children"
+    (let [s (into (set/sorted-set* {:branching-factor 32}) (range 0 5000))
+          _ (set/store s (storage))]
+      (is (pos? (held-children (.-_root ^PersistentSortedSet s)))))))
