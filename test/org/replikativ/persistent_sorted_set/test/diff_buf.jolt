@@ -1,0 +1,342 @@
+(ns org.replikativ.persistent-sorted-set.test.diff-buf
+  "Correctness, isolation, GC reachability, and seeded random stress tests for
+  diff-buffering (:diff-buf-size) and opt-in right-edge leaf append (:edge-append?)."
+  (:require [clojure.edn :as edn]
+            [clojure.test :refer [deftest is testing]]
+            [org.replikativ.persistent-sorted-set :as ss])
+  (:import [java.util Random]
+           [org.replikativ.persistent_sorted_set Branch IStorage Leaf PersistentSortedSet Settings]))
+
+(defn- make-storage
+  "EDN round-tripping test storage with shared node cache (`*mem`), disk map (`*disk`),
+  write/read counters (`*stats`), and freed tracking (`*freed`)."
+  [*mem *disk *stats *freed ^Settings settings]
+  (reify IStorage
+    (store [_ node]
+      (swap! *stats update :writes inc)
+      (let [addr (random-uuid)
+            blob (if (instance? Branch node)
+                   (cond-> {:level (.level ^Branch node)
+                            :keys (.keys ^Branch node)
+                            :addresses (.addresses ^Branch node)
+                            :subtree-count (.-_subtreeCount ^Branch node)}
+                     (.slotsForStorage ^Branch node)
+                     (assoc :slots (.slotsForStorage ^Branch node)))
+                   {:level 0 :keys (.keys ^Leaf node)})]
+        (swap! *disk assoc addr (pr-str blob))
+        addr))
+    (accessed [_ _] (swap! *stats update :accessed inc) nil)
+    (restore [_ addr]
+      (if-let [cached (@*mem addr)]
+        cached
+        (let [{:keys [level keys addresses subtree-count slots]}
+              (edn/read-string (@*disk addr))
+              node (ss/restore-node level keys addresses (or subtree-count -1) settings slots)]
+          (swap! *stats update :reads inc)
+          (swap! *mem assoc addr node)
+          node)))
+    (markFreed [_ addr] (when addr (swap! *freed conj addr)))
+    (isFreed [_ addr] (contains? @*freed addr))
+    (freedInfo [_ _] nil)))
+
+(defn- diff-entries-count [diff child-level]
+  (if-not (map? diff)
+    0
+    (if (zero? child-level)
+      (+ (count (:absent diff)) (count (:present diff)))
+      (reduce-kv (fn [acc _ v] (+ acc (diff-entries-count (:diff v) (dec child-level)))) 0 diff))))
+
+(defn- check-all-blobs-within-budget! [*disk budget]
+  (doseq [[addr raw] @*disk]
+    (let [{:keys [level slots]} (edn/read-string raw)]
+      (when (seq slots)
+        (let [total (reduce-kv (fn [acc _ entry]
+                                 (+ acc (diff-entries-count (:diff entry) (dec level))))
+                               0 slots)]
+          (is (<= total budget)
+              (str "blob " addr " at level " level " exceeded budget " budget ": got " total)))))))
+
+(defn- reachable-addrs [s]
+  (let [seen (atom #{})]
+    (ss/walk-addresses s (fn [a]
+                           (if (contains? @seen a)
+                             false
+                             (do (swap! seen conj a) true))))
+    @seen))
+
+(deftest content-only-commit-is-one-put-and-respects-budget
+  (let [bf 8 b 16
+        mem (atom {}) disk (atom {}) stats (atom {:writes 0 :reads 0 :accessed 0}) freed (atom #{})
+        settings (ss/default-settings bf nil b false)
+        st (make-storage mem disk stats freed settings)
+        s0 (ss/from-sequential compare (range 0 200 2) {:branching-factor bf :diff-buf-size b})
+        a0 (ss/store s0 st)]
+    (reset! stats {:writes 0 :reads 0 :accessed 0})
+    ;; Add 1 element into an existing non-full leaf -> content-only -> exactly 1 PUT (root)
+    (let [s1 (conj s0 5)
+          a1 (ss/store s1 st)]
+      (is (= 1 (:writes @stats)) "content-only commit writes only the root")
+      (let [cold0 (ss/restore a0 (make-storage mem disk stats freed settings)
+                              {:branching-factor bf :diff-buf-size b})
+            cold1 (ss/restore a1 (make-storage mem disk stats freed settings)
+                              {:branching-factor bf :diff-buf-size b})]
+        (is (= (vec s0) (vec cold0)))
+        (is (= (vec s1) (vec cold1)))
+        (is (= (count s0) (count cold0)))
+        (is (= (count s1) (count cold1)))
+        (is (not (contains? cold0 5)))
+        (is (contains? cold1 5))))
+    (check-all-blobs-within-budget! disk b)))
+
+(deftest cross-version-shared-cache-isolation
+  (testing "Consecutive commits buffering against the same cached anchor stay isolated in both read orders"
+    (let [bf 8 b 64
+          mem (atom {}) disk (atom {}) stats (atom {:writes 0 :reads 0 :accessed 0}) freed (atom #{})
+          settings (ss/default-settings bf nil b false)
+          mk #(make-storage mem disk stats freed settings)
+          s0 (ss/from-sequential compare (range 0 600 2) {:branching-factor bf :diff-buf-size b})
+          a0 (ss/store s0 (mk))
+          s1 (-> s0 (conj 1) (conj 101) (conj 301) (disj 200))
+          a1 (ss/store s1 (mk))
+          s2 (-> s1 (conj 3) (disj 101) (conj 501) (disj 598))
+          a2 (ss/store s2 (mk))
+          check-all (fn [order]
+                      (doseq [[label expected addr] order]
+                        (let [r (ss/restore addr (mk) {:branching-factor bf :diff-buf-size b})]
+                          (is (= (vec expected) (vec r)) (str "seq mismatch for " label))
+                          (is (= (count expected) (count r)) (str "count mismatch for " label))
+                          (is (= (ss/count-slice expected 50 450) (ss/count-slice r 50 450))
+                              (str "count-slice mismatch for " label))
+                          (doseq [k [0 1 3 101 200 301 501 598]]
+                            (is (= (contains? expected k) (contains? r k))
+                                (str "contains mismatch for " label " key " k))))))]
+      (check-all [[:v0 s0 a0] [:v1 s1 a1] [:v2 s2 a2]])
+      (check-all [[:v2 s2 a2] [:v1 s1 a1] [:v0 s0 a0]])
+      ;; Every version's walked addresses must exist on disk
+      (doseq [addr [a0 a1 a2]]
+        (let [r (ss/restore addr (mk) {:branching-factor bf :diff-buf-size b})
+              addrs (reachable-addrs r)]
+          (is (every? #(contains? @disk %) addrs)))))))
+
+(deftest coarse-comparator-replace-and-remove
+  (testing "Coarse search comparator [k _] on [k v] elements preserves exact removals/replaces across restore"
+    (let [cmp-full (fn [a b]
+                     (let [c (compare (first a) (first b))]
+                       (if (zero? c) (compare (second a) (second b)) c)))
+          cmp-k (fn [a b] (compare (first a) (first b)))
+          bf 8 b 32
+          mem (atom {}) disk (atom {}) stats (atom {:writes 0 :reads 0 :accessed 0}) freed (atom #{})
+          settings (ss/default-settings bf nil b false)
+          mk #(make-storage mem disk stats freed settings)
+          s0 (ss/from-sequential cmp-full (mapv (fn [k] [k 0]) (range 120))
+                                 {:branching-factor bf :diff-buf-size b})
+          a0 (ss/store s0 (mk))
+          ;; Replace [k 0] -> [k 1], then [k 1] -> [k 2] via coarse probe [k 999], and disj via [k -1]
+          s1 (reduce (fn [s k] (ss/replace s [k 999] [k 1] cmp-k)) s0 (range 0 120 7))
+          a1 (ss/store s1 (mk))
+          s2 (reduce (fn [s k] (ss/replace s [k 888] [k 2] cmp-k)) s1 (range 0 120 7))
+          s3 (reduce (fn [s k] (ss/disj s [k -1] cmp-k)) s2 (range 3 120 11))
+          a3 (ss/store s3 (mk))
+          r1 (ss/restore-by cmp-full a1 (mk) {:branching-factor bf :diff-buf-size b})
+          r3 (ss/restore-by cmp-full a3 (mk) {:branching-factor bf :diff-buf-size b})]
+      (is (= (vec s1) (vec r1)))
+      (is (= (count s1) (count r1)))
+      (is (= (vec s3) (vec r3)))
+      (is (= (count s3) (count r3)))
+      (doseq [k (range 120)]
+        (is (= (ss/lookup s3 [k nil] cmp-k) (ss/lookup r3 [k nil] cmp-k)))))))
+
+(deftest install-slots-refuses-zero-budget
+  (let [bf 8 b 16
+        mem (atom {}) disk (atom {}) stats (atom {:writes 0 :reads 0 :accessed 0}) freed (atom #{})
+        s-on (ss/default-settings bf nil b false)
+        s-off (ss/default-settings bf nil 0 false)
+        s0 (ss/from-sequential compare (range 0 100 2) {:branching-factor bf :diff-buf-size b})
+        _ (ss/store s0 (make-storage mem disk stats freed s-on))
+        s1 (conj s0 3)
+        a1 (ss/store s1 (make-storage mem disk stats freed s-on))
+        bad-st (make-storage (atom {}) disk stats freed s-off)
+        bad-set (ss/restore a1 bad-st {:branching-factor bf :diff-buf-size 0})]
+    (is (thrown? Exception (vec bad-set)))))
+
+(deftest weak-ref-and-checkpointed-transient-with-diff-buf
+  (let [bf 8 b 24
+        mem (atom {}) disk (atom {}) stats (atom {:writes 0 :reads 0 :accessed 0}) freed (atom #{})
+        settings (ss/default-settings bf :weak b false)
+        mk #(make-storage mem disk stats freed settings)
+        s0 (ss/from-sequential compare (range 0 200 2)
+                               {:branching-factor bf :diff-buf-size b :ref-type :weak})
+        a0 (ss/store s0 (mk))
+        ;; After store under :weak, root branch dropped its _children
+        _ (is (nil? (.-_children ^Branch (.root ^PersistentSortedSet s0))))
+        ;; Checkpointed transient: store -> mutate -> store -> mutate -> persistent! -> store
+        t1 (reduce conj! (transient s0) [1 3 5 7 9])
+        at1 (ss/store t1 (mk))
+        t2 (reduce conj! (disj! t1 10) [11 13 15 17])
+        s2 (persistent! t2)
+        a2 (ss/store s2 (mk))
+        ;; Cold restore & continue persistent writes under :weak
+        c2 (ss/restore a2 (mk) {:branching-factor bf :diff-buf-size b :ref-type :weak})
+        s3 (-> c2 (conj 19) (conj 21) (disj 4))
+        a3 (ss/store s3 (mk))
+        c3 (ss/restore a3 (mk) {:branching-factor bf :diff-buf-size b :ref-type :weak})]
+    (is (= (vec s0) (vec (ss/restore a0 (mk) {:branching-factor bf :diff-buf-size b :ref-type :weak}))))
+    (is (= (vec (conj (into s0 [1 3 5 7 9]))) (vec (ss/restore at1 (mk) {:branching-factor bf :diff-buf-size b :ref-type :weak}))))
+    (is (= (vec s2) (vec c2)))
+    (is (= (vec s3) (vec c3)))
+    (check-all-blobs-within-budget! disk b)))
+
+(deftest right-edge-append-preserves-left-leaf-and-handles-deletes
+  (let [bf 8
+        mem (atom {}) disk (atom {}) stats (atom {:writes 0 :reads 0 :accessed 0}) freed (atom #{})
+        settings (ss/default-settings bf nil 0 true)
+        mk #(make-storage mem disk stats freed settings)
+        ;; Fill 1 leaf to capacity (8 elements) and store it
+        s0 (reduce conj (ss/sorted-set* {:branching-factor bf :edge-append? true}) (range 8))
+        _ (ss/store s0 (mk))
+        ;; Append 8..23 one commit at a time: whenever a full leaf splits on right edge,
+        ;; the left leaf is unchanged so its durable address is reused (only new right leaf + branch written)
+        [s1 _] (reduce (fn [[s _] k]
+                         (let [s' (conj s k)
+                               a (ss/store s' (mk))]
+                           [s' a]))
+                       [s0 nil]
+                       (range 8 40))
+        a1 (ss/store s1 (mk))
+        r1 (ss/restore a1 (mk) {:branching-factor bf :edge-append? true})]
+    (is (= (vec (range 40)) (vec r1)))
+    (is (= 40 (count r1)))
+    ;; Delete all elements in reverse order (exercises merging 1-element right leaves into full left leaves)
+    (let [empty-s (reduce disj r1 (reverse (range 40)))]
+      (is (= [] (vec empty-s)))
+      (is (= 0 (count empty-s))))
+    ;; Delete all elements in forward order
+    (let [empty-s2 (reduce disj r1 (range 40))]
+      (is (= [] (vec empty-s2)))
+      (is (= 0 (count empty-s2))))))
+
+(deftest seeded-random-stress-diff-buf
+  (let [cmp-full (fn [a b]
+                   (let [c (compare (first a) (first b))]
+                     (if (zero? c) (compare (second a) (second b)) c)))
+        cmp-k (fn [a b] (compare (first a) (first b)))]
+    (doseq [[bf b ref-type edge?] [[4 4 nil false]
+                                   [8 16 nil false]
+                                   [8 32 :weak true]
+                                   [16 24 :weak true]]
+            seed [1 2 3 42]]
+      (let [rng (Random. (long seed))
+            rint (fn [n] (.nextInt rng (int n)))
+            mem (atom {}) disk (atom {}) stats (atom {:writes 0 :reads 0 :accessed 0}) freed (atom #{})
+            settings (ss/default-settings bf ref-type b edge?)
+            mk #(make-storage mem disk stats freed settings)
+            ropts {:branching-factor bf :diff-buf-size b :ref-type ref-type :edge-append? edge?}
+            keyrange 160
+            ref (atom (sorted-set-by cmp-k))
+            s0 (reduce (fn [s _]
+                         (let [k (rint keyrange) el [k 0]]
+                           (swap! ref conj el)
+                           (conj s el)))
+                       (ss/sorted-set* (assoc ropts :comparator cmp-full))
+                       (range 80))
+            a0 (ss/store s0 (mk))]
+        (loop [cycle 0 s s0 last-a a0]
+          (when (< cycle 25)
+            (let [use-transient? (< (.nextDouble rng) 0.25)
+                  s1 (if use-transient?
+                       (persistent!
+                         (reduce (fn [t _]
+                                   (let [k (rint keyrange)
+                                         op (rint 3)]
+                                     (if (zero? op)
+                                       (if (contains? @ref [k 0])
+                                         (do (swap! ref disj [k 0]) (ss/disj t [k -1] cmp-k))
+                                         t)
+                                       (let [el [k 0]]
+                                         (if (contains? @ref el)
+                                           t
+                                           (do (swap! ref conj el) (conj! t el)))))))
+                                 (transient s)
+                                 (range 4)))
+                       (reduce (fn [s _]
+                                 (let [k (rint keyrange)
+                                       op (rint 3)]
+                                   (case op
+                                     0 (if (contains? @ref [k 0])
+                                         (let [v (inc (rint 50))
+                                               el [k v]]
+                                           (swap! ref disj [k 0])
+                                           (swap! ref conj el)
+                                           (ss/replace s [k -1] el cmp-k))
+                                         s)
+                                     1 (if (contains? @ref [k 0])
+                                         (do (swap! ref disj [k 0])
+                                             (ss/disj s [k -1] cmp-k))
+                                         s)
+                                     (if (contains? @ref [k 0])
+                                       s
+                                       (let [el [k 0]]
+                                         (swap! ref conj el)
+                                         (conj s el))))))
+                               s
+                               (range 4)))
+                  a1 (ss/store s1 (mk))
+                  cold? (< (.nextDouble rng) 0.5)
+                  s-next (if cold? (ss/restore-by cmp-full a1 (mk) ropts) s1)]
+              (is (= (vec (seq @ref)) (vec (seq s-next)))
+                  (str "mismatch bf=" bf " b=" b " seed=" seed " cycle=" cycle " cold=" cold?))
+              (is (= (count @ref) (count s-next))
+                  (str "count mismatch bf=" bf " b=" b " seed=" seed " cycle=" cycle))
+              (let [lo (rint keyrange) hi (+ lo (rint 60))
+                    ref-slice (count (filter #(<= lo (first %) hi) @ref))]
+                (is (= ref-slice (ss/count-slice s-next [lo nil] [hi nil] cmp-k))
+                    (str "count-slice mismatch bf=" bf " b=" b " seed=" seed " cycle=" cycle)))
+              (recur (inc cycle) s-next a1))))
+        (check-all-blobs-within-budget! disk b)))))
+
+(deftest deep-tree-and-forked-lineage-refresh-markers
+  (testing "Depth >= 4 trees with budget overflows, branch merges/splits, and forked versions sharing dirty subtrees"
+    (let [bf 4 b 8
+          mem (atom {}) disk (atom {}) stats (atom {:writes 0 :reads 0 :accessed 0}) freed (atom #{})
+          settings (ss/default-settings bf :weak b true)
+          mk #(make-storage mem disk stats freed settings)
+          ropts {:branching-factor bf :diff-buf-size b :ref-type :weak :edge-append? true}
+          s0 (ss/from-sequential compare (range 0 600 2) ropts)
+          a0 (ss/store s0 (mk))
+          ;; Branch A and Branch B both descend from s0, share dirty branch children, then diverge
+          shared (-> s0 (conj 1) (conj 3) (conj 5) (disj 100) (disj 300))
+          sA (-> shared (conj 7) (conj 9) (conj 11) (conj 13) (conj 15) (conj 17) (conj 19))
+          sB (-> shared (conj 501) (disj 200))
+          ;; Storing sA settles/flushes shared branch children; storing sB afterwards must detect settled markers
+          aA (ss/store sA (mk))
+          aB (ss/store sB (mk))
+          r0 (ss/restore a0 (mk) ropts)
+          rA (ss/restore aA (mk) ropts)
+          rB (ss/restore aB (mk) ropts)]
+      (is (= (vec s0) (vec r0)))
+      (is (= (vec sA) (vec rA)))
+      (is (= (vec sB) (vec rB)))
+      (is (= (count sA) (count rA)))
+      (is (= (count sB) (count rB)))
+      (check-all-blobs-within-budget! disk b)))
+  (testing "Removing/replacing boolean `false` under a coarse comparator records `false`, not the probe"
+    (let [cmp-const (fn [a b]
+                      (let [ia (if (boolean? a) 50 a)
+                            ib (if (boolean? b) 50 b)]
+                        (compare ia ib)))
+          bf 4 b 16
+          mem (atom {}) disk (atom {}) stats (atom {:writes 0 :reads 0 :accessed 0}) freed (atom #{})
+          settings (ss/default-settings bf nil b false)
+          mk #(make-storage mem disk stats freed settings)
+          ropts {:branching-factor bf :diff-buf-size b}
+          s0 (reduce conj (ss/sorted-set* (assoc ropts :comparator cmp-const))
+                     (concat (range 40) [false] (range 60 90)))
+          _ (ss/store s0 (mk))
+          ;; Remove `false` using probe `50` (compares 0 to `false` under cmp-const)
+          s1 (ss/disj s0 50 cmp-const)
+          a1 (ss/store s1 (mk))
+          r1 (ss/restore-by cmp-const a1 (mk) ropts)]
+      (is (= (vec s1) (vec r1)))
+      (is (= (count s1) (count r1)))
+      (is (not (some false? (seq r1)))))))
+
