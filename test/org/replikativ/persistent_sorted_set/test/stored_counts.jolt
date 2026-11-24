@@ -1,0 +1,96 @@
+(ns org.replikativ.persistent-sorted-set.test.stored-counts
+  "Regression tests for PSS 0.5.146-0.5.148 stored subtree counts across cold writes,
+  splits, joins, borrows, diff-buf, edge-append, transients, count-census, and recount."
+  (:require [clojure.test :refer [deftest is testing]]
+            [org.replikativ.persistent-sorted-set :as pss])
+  (:import [org.replikativ.persistent-sorted-set IStorage Leaf Branch]))
+
+(defn- make-cold-storage [bf dbs ea]
+  (let [db (atom {})
+        id (atom 0)
+        restores (atom 0)]
+    {:db db
+     :restores restores
+     :storage
+     (reify IStorage
+       (store [_ node]
+         (let [k (swap! id inc)
+               snap (if (instance? Leaf node)
+                      {:type :leaf :keys (.keys node)}
+                      {:type :branch :level (.level node) :keys (.keys node)
+                       :addresses (.addresses node) :subtree-count (.subtreeCount node)
+                       :slots (.slotsForStorage node)})]
+           (swap! db assoc k snap)
+           k))
+       (restore [_ addr]
+         (swap! restores inc)
+         (let [{:keys [type level keys addresses subtree-count slots]} (get @db addr)
+               s (pss/default-settings bf (when ea :edge) dbs)]
+           (if (= type :leaf)
+             (pss/restore-node 0 keys nil -1 s)
+             (pss/restore-node level keys addresses subtree-count s slots))))
+       (accessed [_ _])
+       (markFreed [_ _]))}))
+
+(deftest cold-writes-keep-every-branch-count
+  (doseq [[bf dbs ea] [[8 0 false] [8 16 false] [8 16 true] [16 32 true]]]
+    (testing (str "bf=" bf " dbs=" dbs " ea=" ea)
+      (let [{:keys [storage]} (make-cold-storage bf dbs ea)
+            opts {:branching-factor bf :diff-buf-size dbs :edge-append? ea}
+            s0 (reduce conj (pss/sorted-set* (assoc opts :storage storage)) (range 0 1200 2))
+            a0 (pss/store s0)]
+        (loop [round 0 addr a0 expected (set (range 0 1200 2))]
+          (if (= round 25)
+            (let [s (pss/restore addr storage opts)
+                  cen (pss/count-census s)]
+              (is (pss/has-subtree-counts? s))
+              (is (zero? (:unknown cen)))
+              (is (pos? (:branches cen)))
+              (is (= (count expected) (count s)))
+              (is (= (sort expected) (seq s))))
+            (let [s (pss/restore addr storage opts)
+                  adds (for [j (range 15)] (+ (* round 37) (* j 3) 1))
+                  dels (for [j (range 10)] (* (+ (* round 13) j) 4))
+                  ;; alternate persistent and transient writes on cold trees
+                  s2 (if (even? round)
+                       (-> (reduce conj s adds)
+                           (#(reduce disj % dels)))
+                       (persistent!
+                         (let [t (reduce conj! (transient s) adds)]
+                           (reduce disj! t dels))))
+                  a1 (pss/store s2)
+                  reloaded (pss/restore a1 storage opts)
+                  exp2 (-> expected (into adds) (#(apply disj % dels)))]
+              (is (pss/has-subtree-counts? s2))
+              (is (zero? (:unknown (pss/count-census reloaded))))
+              (recur (inc round) a1 exp2))))))))
+
+(deftest recount-repairs-legacy-uncounted-tree
+  (let [{:keys [db storage]} (make-cold-storage 8 16 true)
+        opts {:branching-factor 8 :diff-buf-size 16 :edge-append? true}
+        s0 (reduce conj (pss/sorted-set* (assoc opts :storage storage)) (range 400))
+        a0 (pss/store s0)]
+    ;; Strip every stored branch count to -1 (legacy format)
+    (swap! db (fn [m]
+                (into {} (map (fn [[k v]]
+                                [k (if (= (:type v) :branch)
+                                     (assoc v :subtree-count -1)
+                                     v)])
+                              m))))
+    (let [old-s (pss/restore a0 storage opts)
+          cen0 (pss/count-census old-s)]
+      (is (not (pss/has-subtree-counts? old-s)))
+      (is (= (:branches cen0) (:unknown cen0)))
+      ;; Lazy count must NOT falsely mark stored tree as counted
+      (is (= 400 (count old-s)))
+      (is (not (pss/has-subtree-counts? old-s)))
+      (let [repaired (pss/recount old-s)
+            a1 (pss/store repaired)
+            reloaded (pss/restore a1 storage opts)
+            cen1 (pss/count-census reloaded)]
+        (is (pss/has-subtree-counts? reloaded))
+        (is (zero? (:unknown cen1)))
+        (is (= 400 (count reloaded)))
+        (is (= (range 400) (seq reloaded)))
+        ;; Idempotent on already-counted tree
+        (is (identical? reloaded (pss/recount reloaded)))))))
